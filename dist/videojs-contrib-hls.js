@@ -1,6 +1,6 @@
 /**
  * videojs-contrib-hls
- * @version 5.3.5
+ * @version 5.3.4
  * @copyright 2017 Brightcove, Inc
  * @license Apache-2.0
  */
