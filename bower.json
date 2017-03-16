@@ -1,8 +1,8 @@
 {
-  "name": "videojs-contrib-hls-bower",
-  "version": "5.3.4",
+  "name": "bower-videojs-contrib-hls",
+  "version": "5.3.5",
   "description": "Play back HLS with video.js, even where it's not natively supported",
-  "main": "dist/videojs-contrib-hls.min.js",
+  "main": "dist/videojs-contrib-hls.js",
   "authors": [
     "Brightcove",
     "Inc"
