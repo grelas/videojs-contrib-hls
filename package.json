@@ -79,6 +79,7 @@
     ]
   },
   "files": [
+    "bower.json",
     "CONTRIBUTING.md",
     "dist/",
     "docs/",
