@@ -1,0 +1,31 @@
+{
+  "name": "videojs-contrib-hls-bower",
+  "version": "5.3.3",
+  "description": "Play back HLS with video.js, even where it's not natively supported",
+  "main": "dist/videojs-contrib-hls.min.js",
+  "authors": [
+    "Brightcove",
+    "Inc"
+  ],
+  "license": "Apache-2.0",
+  "keywords": [
+    "videojs",
+    "videojs-plugin"
+  ],
+  "homepage": "https://github.com/grelas/videojs-contrib-hls",
+  "ignore": [
+    "**/.*",
+    "node_modules",
+    "bower_components",
+    "test",
+    "tests",
+    "dist-test",
+    "docs",
+    "es5",
+    "examples",
+    "scripts",
+    "src",
+    "test",
+    "utils"
+  ]
+}
