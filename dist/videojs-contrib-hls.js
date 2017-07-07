@@ -1,6 +1,6 @@
 /**
  * videojs-contrib-hls
- * @version 5.3.4
+ * @version 5.8.0
  * @copyright 2017 Brightcove, Inc
  * @license Apache-2.0
  */
@@ -117,7 +117,7 @@ exports['default'] = {
   findAdCue: findAdCue
 };
 module.exports = exports['default'];
-},{"global/window":29}],2:[function(require,module,exports){
+},{"global/window":30}],2:[function(require,module,exports){
 /**
  * @file bin-utils.js
  */
@@ -186,6 +186,19 @@ var createTransferableMessage = function createTransferableMessage(message) {
 };
 
 /**
+ * Returns a unique string identifier for a media initialization
+ * segment.
+ */
+var initSegmentId = function initSegmentId(initSegment) {
+  var byterange = initSegment.byterange || {
+    length: Infinity,
+    offset: 0
+  };
+
+  return [byterange.length, byterange.offset, initSegment.resolvedUri].join(',');
+};
+
+/**
  * utils to help dump binary data to the console
  */
 var utils = {
@@ -215,7 +228,8 @@ var utils = {
     }
     return result;
   },
-  createTransferableMessage: createTransferableMessage
+  createTransferableMessage: createTransferableMessage,
+  initSegmentId: initSegmentId
 };
 
 exports['default'] = utils;
@@ -227,7 +241,16 @@ Object.defineProperty(exports, "__esModule", {
   value: true
 });
 exports["default"] = {
-  GOAL_BUFFER_LENGTH: 30
+  GOAL_BUFFER_LENGTH: 30,
+  MAX_GOAL_BUFFER_LENGTH: 60,
+  GOAL_BUFFER_LENGTH_RATE: 1,
+  // A fudge factor to apply to advertised playlist bitrates to account for
+  // temporary flucations in client bandwidth
+  BANDWIDTH_VARIANCE: 1.2,
+  // How much of the buffer must be filled before we consider upswitching
+  BUFFER_LOW_WATER_LINE: 0,
+  MAX_BUFFER_LOW_WATER_LINE: 30,
+  BUFFER_LOW_WATER_LINE_RATE: 1
 };
 module.exports = exports["default"];
 },{}],4:[function(require,module,exports){
@@ -278,7 +301,7 @@ exports['default'] = function (self) {
 };
 
 module.exports = exports['default'];
-},{"./bin-utils":2,"aes-decrypter":22,"global/window":29}],5:[function(require,module,exports){
+},{"./bin-utils":2,"aes-decrypter":23,"global/window":30}],5:[function(require,module,exports){
 (function (global){
 /**
  * @file master-playlist-controller.js
@@ -307,6 +330,10 @@ var _segmentLoader = require('./segment-loader');
 
 var _segmentLoader2 = _interopRequireDefault(_segmentLoader);
 
+var _vttSegmentLoader = require('./vtt-segment-loader');
+
+var _vttSegmentLoader2 = _interopRequireDefault(_vttSegmentLoader);
+
 var _ranges = require('./ranges');
 
 var _ranges2 = _interopRequireDefault(_ranges);
@@ -333,9 +360,19 @@ var _decrypterWorker = require('./decrypter-worker');
 
 var _decrypterWorker2 = _interopRequireDefault(_decrypterWorker);
 
-// 5 minute blacklist
-var BLACKLIST_DURATION = 5 * 60 * 1000;
+var _config = require('./config');
+
+var _config2 = _interopRequireDefault(_config);
+
 var Hls = undefined;
+
+// Default codec parameters if none were provided for video and/or audio
+var defaultCodecs = {
+  videoCodec: 'avc1',
+  videoObjectTypeIndicator: '.4d400d',
+  // AAC-LC
+  audioProfile: '2'
+};
 
 // SegmentLoader stats that need to have each loader's
 // values summed to calculate the final value
@@ -379,10 +416,7 @@ var objectChanged = function objectChanged(a, b) {
  */
 var parseCodecs = function parseCodecs(codecs) {
   var result = {
-    codecCount: 0,
-    videoCodec: null,
-    videoObjectTypeIndicator: null,
-    audioProfile: null
+    codecCount: 0
   };
   var parsed = undefined;
 
@@ -420,6 +454,55 @@ var mapLegacyAvcCodecs_ = function mapLegacyAvcCodecs_(codecString) {
 
 exports.mapLegacyAvcCodecs_ = mapLegacyAvcCodecs_;
 /**
+ * Build a media mime-type string from a set of parameters
+ * @param {String} type either 'audio' or 'video'
+ * @param {String} container either 'mp2t' or 'mp4'
+ * @param {Array} codecs an array of codec strings to add
+ * @return {String} a valid media mime-type
+ */
+var makeMimeTypeString = function makeMimeTypeString(type, container, codecs) {
+  // The codecs array is filtered so that falsey values are
+  // dropped and don't cause Array#join to create spurious
+  // commas
+  return type + '/' + container + '; codecs="' + codecs.filter(function (c) {
+    return !!c;
+  }).join(', ') + '"';
+};
+
+/**
+ * Returns the type container based on information in the playlist
+ * @param {Playlist} media the current media playlist
+ * @return {String} a valid media container type
+ */
+var getContainerType = function getContainerType(media) {
+  // An initialization segment means the media playlist is an iframe
+  // playlist or is using the mp4 container. We don't currently
+  // support iframe playlists, so assume this is signalling mp4
+  // fragments.
+  if (media.segments && media.segments.length && media.segments[0].map) {
+    return 'mp4';
+  }
+  return 'mp2t';
+};
+
+/**
+ * Returns a set of codec strings parsed from the playlist or the default
+ * codec strings if no codecs were specified in the playlist
+ * @param {Playlist} media the current media playlist
+ * @return {Object} an object with the video and audio codecs
+ */
+var getCodecs = function getCodecs(media) {
+  // if the codecs were explicitly specified, use them instead of the
+  // defaults
+  var mediaAttributes = media.attributes || {};
+
+  if (mediaAttributes.CODECS) {
+    return parseCodecs(mediaAttributes.CODECS);
+  }
+  return defaultCodecs;
+};
+
+/**
  * Calculates the MIME type strings for a working configuration of
  * SourceBuffers to play variant streams in a master playlist. If
  * there is no possible working configuration, an empty array will be
@@ -434,65 +517,79 @@ exports.mapLegacyAvcCodecs_ = mapLegacyAvcCodecs_;
  * @private
  */
 var mimeTypesForPlaylist_ = function mimeTypesForPlaylist_(master, media) {
-  var container = 'mp2t';
-  var codecs = {
-    videoCodec: 'avc1',
-    videoObjectTypeIndicator: '.4d400d',
-    audioProfile: '2'
-  };
-  var audioGroup = [];
-  var mediaAttributes = undefined;
-  var previousGroup = null;
+  var containerType = getContainerType(media);
+  var codecInfo = getCodecs(media);
+  var mediaAttributes = media.attributes || {};
+  // Default condition for a traditional HLS (no demuxed audio/video)
+  var isMuxed = true;
+  var isMaat = false;
 
   if (!media) {
-    // not enough information, return an error
+    // Not enough information
     return [];
   }
-  // An initialization segment means the media playlists is an iframe
-  // playlist or is using the mp4 container. We don't currently
-  // support iframe playlists, so assume this is signalling mp4
-  // fragments.
-  // the existence check for segments can be removed once
-  // https://github.com/videojs/m3u8-parser/issues/8 is closed
-  if (media.segments && media.segments.length && media.segments[0].map) {
-    container = 'mp4';
-  }
 
-  // if the codecs were explicitly specified, use them instead of the
-  // defaults
-  mediaAttributes = media.attributes || {};
-  if (mediaAttributes.CODECS) {
-    (function () {
-      var parsedCodecs = parseCodecs(mediaAttributes.CODECS);
+  if (master.mediaGroups.AUDIO && mediaAttributes.AUDIO) {
+    var audioGroup = master.mediaGroups.AUDIO[mediaAttributes.AUDIO];
 
-      Object.keys(parsedCodecs).forEach(function (key) {
-        codecs[key] = parsedCodecs[key] || codecs[key];
-      });
-    })();
-  }
-
-  if (master.mediaGroups.AUDIO) {
-    audioGroup = master.mediaGroups.AUDIO[mediaAttributes.AUDIO];
-  }
-
-  // if audio could be muxed or unmuxed, use mime types appropriate
-  // for both scenarios
-  for (var groupId in audioGroup) {
-    if (previousGroup && !!audioGroup[groupId].uri !== !!previousGroup.uri) {
-      // one source buffer with muxed video and audio and another for
-      // the alternate audio
-      return ['video/' + container + '; codecs="' + codecs.videoCodec + codecs.videoObjectTypeIndicator + ', mp4a.40.' + codecs.audioProfile + '"', 'audio/' + container + '; codecs="mp4a.40.' + codecs.audioProfile + '"'];
+    // Handle the case where we are in a multiple-audio track scenario
+    if (audioGroup) {
+      isMaat = true;
+      // Start with the everything demuxed then...
+      isMuxed = false;
+      // ...check to see if any audio group tracks are muxed (ie. lacking a uri)
+      for (var groupId in audioGroup) {
+        if (!audioGroup[groupId].uri) {
+          isMuxed = true;
+          break;
+        }
+      }
     }
-    previousGroup = audioGroup[groupId];
-  }
-  // if all video and audio is unmuxed, use two single-codec mime
-  // types
-  if (previousGroup && previousGroup.uri) {
-    return ['video/' + container + '; codecs="' + codecs.videoCodec + codecs.videoObjectTypeIndicator + '"', 'audio/' + container + '; codecs="mp4a.40.' + codecs.audioProfile + '"'];
   }
 
-  // all video and audio are muxed, use a dual-codec mime type
-  return ['video/' + container + '; codecs="' + codecs.videoCodec + codecs.videoObjectTypeIndicator + ', mp4a.40.' + codecs.audioProfile + '"'];
+  // HLS with multiple-audio tracks must always get an audio codec.
+  // Put another way, there is no way to have a video-only multiple-audio HLS!
+  if (isMaat && !codecInfo.audioProfile) {
+    _videoJs2['default'].log.warn('Multiple audio tracks present but no audio codec string is specified. ' + 'Attempting to use the default audio codec (mp4a.40.2)');
+    codecInfo.audioProfile = defaultCodecs.audioProfile;
+  }
+
+  // Generate the final codec strings from the codec object generated above
+  var codecStrings = {};
+
+  if (codecInfo.videoCodec) {
+    codecStrings.video = '' + codecInfo.videoCodec + codecInfo.videoObjectTypeIndicator;
+  }
+
+  if (codecInfo.audioProfile) {
+    codecStrings.audio = 'mp4a.40.' + codecInfo.audioProfile;
+  }
+
+  // Finally, make and return an array with proper mime-types depending on
+  // the configuration
+  var justAudio = makeMimeTypeString('audio', containerType, [codecStrings.audio]);
+  var justVideo = makeMimeTypeString('video', containerType, [codecStrings.video]);
+  var bothVideoAudio = makeMimeTypeString('video', containerType, [codecStrings.video, codecStrings.audio]);
+
+  if (isMaat) {
+    if (!isMuxed && codecStrings.video) {
+      return [justVideo, justAudio];
+    }
+    // There exists the possiblity that this will return a `video/container`
+    // mime-type for the first entry in the array even when there is only audio.
+    // This doesn't appear to be a problem and simplifies the code.
+    return [bothVideoAudio, justAudio];
+  }
+
+  // If there is ano video codec at all, always just return a single
+  // audio/<container> mime-type
+  if (!codecStrings.video) {
+    return [justAudio];
+  }
+
+  // When not using separate audio media groups, audio and video is
+  // *always* muxed
+  return [bothVideoAudio];
 };
 
 exports.mimeTypesForPlaylist_ = mimeTypesForPlaylist_;
@@ -523,6 +620,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
     var bandwidth = options.bandwidth;
     var externHls = options.externHls;
     var useCueTags = options.useCueTags;
+    var blacklistDuration = options.blacklistDuration;
 
     if (!url) {
       throw new Error('A non-empty playlist URL is required');
@@ -535,18 +633,19 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
     this.hls_ = tech.hls;
     this.mode_ = mode;
     this.useCueTags_ = useCueTags;
+    this.blacklistDuration = blacklistDuration;
     if (this.useCueTags_) {
       this.cueTagsTrack_ = this.tech_.addTextTrack('metadata', 'ad-cues');
       this.cueTagsTrack_.inBandMetadataTrackDispatchType = '';
     }
 
-    this.audioTracks_ = [];
     this.requestOptions_ = {
       withCredentials: this.withCredentials,
       timeout: null
     };
 
     this.audioGroups_ = {};
+    this.subtitleGroups_ = { groups: {}, tracks: {} };
 
     this.mediaSource = new _videoJs2['default'].MediaSource({ mode: mode });
     this.audioinfo_ = null;
@@ -560,7 +659,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
       return false;
     };
 
-    this.syncController_ = new _syncController2['default']();
+    this.syncController_ = new _syncController2['default'](options);
     this.segmentMetadataTrack_ = tech.addRemoteTextTrack({
       kind: 'metadata',
       label: 'segment-metadata'
@@ -568,7 +667,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
 
     this.decrypter_ = (0, _webworkify2['default'])(_decrypterWorker2['default']);
 
-    var segmentLoaderOptions = {
+    var segmentLoaderSettings = {
       hls: this.hls_,
       mediaSource: this.mediaSource,
       currentTime: this.tech_.currentTime.bind(this.tech_),
@@ -578,11 +677,14 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
       seeking: function seeking() {
         return _this.tech_.seeking();
       },
-      setCurrentTime: function setCurrentTime(a) {
-        return _this.tech_.setCurrentTime(a);
+      duration: function duration() {
+        return _this.mediaSource.duration;
       },
       hasPlayed: function hasPlayed() {
         return _this.hasPlayed_();
+      },
+      goalBufferLength: function goalBufferLength() {
+        return _this.goalBufferLength();
       },
       bandwidth: bandwidth,
       syncController: this.syncController_,
@@ -593,27 +695,32 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
     this.masterPlaylistLoader_ = new _playlistLoader2['default'](url, this.hls_, this.withCredentials);
     this.setupMasterPlaylistLoaderListeners_();
     this.audioPlaylistLoader_ = null;
+    this.subtitlePlaylistLoader_ = null;
 
     // setup segment loaders
     // combined audio/video or just video when alternate audio track is selected
-    this.mainSegmentLoader_ = new _segmentLoader2['default'](_videoJs2['default'].mergeOptions(segmentLoaderOptions, {
+    this.mainSegmentLoader_ = new _segmentLoader2['default'](_videoJs2['default'].mergeOptions(segmentLoaderSettings, {
       segmentMetadataTrack: this.segmentMetadataTrack_,
       loaderType: 'main'
-    }));
+    }), options);
 
     // alternate audio track
-    this.audioSegmentLoader_ = new _segmentLoader2['default'](_videoJs2['default'].mergeOptions(segmentLoaderOptions, {
+    this.audioSegmentLoader_ = new _segmentLoader2['default'](_videoJs2['default'].mergeOptions(segmentLoaderSettings, {
       loaderType: 'audio'
-    }));
+    }), options);
+
+    this.subtitleSegmentLoader_ = new _vttSegmentLoader2['default'](_videoJs2['default'].mergeOptions(segmentLoaderSettings, {
+      loaderType: 'vtt'
+    }), options);
 
     this.setupSegmentLoaderListeners_();
-
-    this.masterPlaylistLoader_.start();
 
     // Create SegmentLoader stat-getters
     loaderStats.forEach(function (stat) {
       _this[stat + '_'] = sumLoaderStat.bind(_this, stat);
     });
+
+    this.masterPlaylistLoader_.load();
   }
 
   /**
@@ -650,6 +757,11 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
         _this2.fillAudioTracks_();
         _this2.setupAudio();
 
+        _this2.fillSubtitleTracks_();
+        _this2.setupSubtitles();
+
+        _this2.triggerPresenceUsage_(_this2.master(), media);
+
         try {
           _this2.setupSourceBuffers_();
         } catch (e) {
@@ -682,6 +794,13 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
         // on `mediachange`
         _this2.mainSegmentLoader_.playlist(updatedPlaylist, _this2.requestOptions_);
         _this2.updateDuration();
+
+        // If the player isn't paused, ensure that the segment loader is running,
+        // as it is possible that it was temporarily stopped while waiting for
+        // a playlist (e.g., in case the playlist errored and we re-requested it).
+        if (!_this2.tech_.paused()) {
+          _this2.mainSegmentLoader_.load();
+        }
 
         if (!updatedPlaylist.endList) {
           (function () {
@@ -749,15 +868,87 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
           return track.enabled;
         })[0];
         if (!activeTrack) {
-          _this2.setupAudio();
+          _this2.mediaGroupChanged();
           _this2.trigger('audioupdate');
         }
+        _this2.setupSubtitles();
 
         _this2.tech_.trigger({
           type: 'mediachange',
           bubbles: true
         });
       });
+
+      this.masterPlaylistLoader_.on('playlistunchanged', function () {
+        var updatedPlaylist = _this2.masterPlaylistLoader_.media();
+        var playlistOutdated = _this2.stuckAtPlaylistEnd_(updatedPlaylist);
+
+        if (playlistOutdated) {
+          // Playlist has stopped updating and we're stuck at its end. Try to
+          // blacklist it and switch to another playlist in the hope that that
+          // one is updating (and give the player a chance to re-adjust to the
+          // safe live point).
+          _this2.blacklistCurrentPlaylist({
+            message: 'Playlist no longer updating.'
+          });
+          // useful for monitoring QoS
+          _this2.tech_.trigger('playliststuck');
+        }
+      });
+
+      this.masterPlaylistLoader_.on('renditiondisabled', function () {
+        _this2.tech_.trigger({ type: 'usage', name: 'hls-rendition-disabled' });
+      });
+      this.masterPlaylistLoader_.on('renditionenabled', function () {
+        _this2.tech_.trigger({ type: 'usage', name: 'hls-rendition-enabled' });
+      });
+    }
+
+    /**
+     * A helper function for triggerring presence usage events once per source
+     *
+     * @private
+     */
+  }, {
+    key: 'triggerPresenceUsage_',
+    value: function triggerPresenceUsage_(master, media) {
+      var mediaGroups = master.mediaGroups || {};
+      var defaultDemuxed = true;
+      var audioGroupKeys = Object.keys(mediaGroups.AUDIO);
+
+      for (var mediaGroup in mediaGroups.AUDIO) {
+        for (var label in mediaGroups.AUDIO[mediaGroup]) {
+          var properties = mediaGroups.AUDIO[mediaGroup][label];
+
+          if (!properties.uri) {
+            defaultDemuxed = false;
+          }
+        }
+      }
+
+      if (defaultDemuxed) {
+        this.tech_.trigger({ type: 'usage', name: 'hls-demuxed' });
+      }
+
+      if (Object.keys(mediaGroups.SUBTITLES).length) {
+        this.tech_.trigger({ type: 'usage', name: 'hls-webvtt' });
+      }
+
+      if (Hls.Playlist.isAes(media)) {
+        this.tech_.trigger({ type: 'usage', name: 'hls-aes' });
+      }
+
+      if (Hls.Playlist.isFmp4(media)) {
+        this.tech_.trigger({ type: 'usage', name: 'hls-fmp4' });
+      }
+
+      if (audioGroupKeys.length && Object.keys(mediaGroups.AUDIO[audioGroupKeys[0]]).length > 1) {
+        this.tech_.trigger({ type: 'usage', name: 'hls-alternate-audio' });
+      }
+
+      if (this.useCueTags_) {
+        this.tech_.trigger({ type: 'usage', name: 'hls-playlist-cue-tags' });
+      }
     }
 
     /**
@@ -772,9 +963,30 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
       var _this3 = this;
 
       this.mainSegmentLoader_.on('bandwidthupdate', function () {
-        // figure out what stream the next segment should be downloaded from
-        // with the updated bandwidth information
-        _this3.masterPlaylistLoader_.media(_this3.selectPlaylist());
+        var nextPlaylist = _this3.selectPlaylist();
+        var currentPlaylist = _this3.masterPlaylistLoader_.media();
+        var buffered = _this3.tech_.buffered();
+        var forwardBuffer = buffered.length ? buffered.end(buffered.length - 1) - _this3.tech_.currentTime() : 0;
+
+        var bufferLowWaterLine = _this3.bufferLowWaterLine();
+
+        // If the playlist is live, then we want to not take low water line into account.
+        // This is because in LIVE, the player plays 3 segments from the end of the
+        // playlist, and if `BUFFER_LOW_WATER_LINE` is greater than the duration availble
+        // in those segments, a viewer will never experience a rendition upswitch.
+        if (!currentPlaylist.endList ||
+        // For the same reason as LIVE, we ignore the low water line when the VOD
+        // duration is below the max potential low water line
+        _this3.duration() < _config2['default'].MAX_BUFFER_LOW_WATER_LINE ||
+        // we want to switch down to lower resolutions quickly to continue playback, but
+        nextPlaylist.attributes.BANDWIDTH < currentPlaylist.attributes.BANDWIDTH ||
+        // ensure we have some buffer before we switch up to prevent us running out of
+        // buffer while loading a higher rendition.
+        forwardBuffer >= bufferLowWaterLine) {
+          _this3.masterPlaylistLoader_.media(nextPlaylist);
+        }
+
+        _this3.tech_.trigger('bandwidthupdate');
       });
       this.mainSegmentLoader_.on('progress', function () {
         _this3.trigger('progress');
@@ -788,8 +1000,19 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
         _this3.onSyncInfoUpdate_();
       });
 
+      this.mainSegmentLoader_.on('timestampoffset', function () {
+        _this3.tech_.trigger({ type: 'usage', name: 'hls-timestamp-offset' });
+      });
       this.audioSegmentLoader_.on('syncinfoupdate', function () {
         _this3.onSyncInfoUpdate_();
+      });
+
+      this.mainSegmentLoader_.on('ended', function () {
+        _this3.onEndOfStream();
+      });
+
+      this.audioSegmentLoader_.on('ended', function () {
+        _this3.onEndOfStream();
       });
 
       this.audioSegmentLoader_.on('error', function () {
@@ -798,6 +1021,8 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
         _this3.audioPlaylistLoader_ = null;
         _this3.setupAudio();
       });
+
+      this.subtitleSegmentLoader_.on('error', this.handleSubtitleError_.bind(this));
     }
   }, {
     key: 'handleAudioinfoUpdate_',
@@ -902,6 +1127,47 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
     }
 
     /**
+     * fill our internal list of Subtitle Tracks with data from
+     * the master playlist or use a default
+     *
+     * @private
+     */
+  }, {
+    key: 'fillSubtitleTracks_',
+    value: function fillSubtitleTracks_() {
+      var master = this.master();
+      var mediaGroups = master.mediaGroups || {};
+
+      for (var mediaGroup in mediaGroups.SUBTITLES) {
+        if (!this.subtitleGroups_.groups[mediaGroup]) {
+          this.subtitleGroups_.groups[mediaGroup] = [];
+        }
+
+        for (var label in mediaGroups.SUBTITLES[mediaGroup]) {
+          var properties = mediaGroups.SUBTITLES[mediaGroup][label];
+
+          if (!properties.forced) {
+            this.subtitleGroups_.groups[mediaGroup].push(_videoJs2['default'].mergeOptions({ id: label }, properties));
+
+            if (typeof this.subtitleGroups_.tracks[label] === 'undefined') {
+              var track = this.tech_.addRemoteTextTrack({
+                id: label,
+                kind: 'subtitles',
+                enabled: false,
+                language: properties.language,
+                label: label
+              }, true).track;
+
+              this.subtitleGroups_.tracks[label] = track;
+            }
+          }
+        }
+      }
+
+      // Do not enable a default subtitle track. Wait for user interaction instead.
+    }
+
+    /**
      * Call load on our SegmentLoaders
      */
   }, {
@@ -910,6 +1176,9 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
       this.mainSegmentLoader_.load();
       if (this.audioPlaylistLoader_) {
         this.audioSegmentLoader_.load();
+      }
+      if (this.subtitlePlaylistLoader_) {
+        this.subtitleSegmentLoader_.load();
       }
     }
 
@@ -931,17 +1200,93 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
     }
 
     /**
+     * Returns the subtitle group for the currently active primary
+     * media playlist.
+     */
+  }, {
+    key: 'activeSubtitleGroup_',
+    value: function activeSubtitleGroup_() {
+      var videoPlaylist = this.masterPlaylistLoader_.media();
+      var result = undefined;
+
+      if (!videoPlaylist) {
+        return null;
+      }
+
+      if (videoPlaylist.attributes && videoPlaylist.attributes.SUBTITLES) {
+        result = this.subtitleGroups_.groups[videoPlaylist.attributes.SUBTITLES];
+      }
+
+      return result || this.subtitleGroups_.groups.main;
+    }
+  }, {
+    key: 'activeSubtitleTrack_',
+    value: function activeSubtitleTrack_() {
+      for (var trackName in this.subtitleGroups_.tracks) {
+        if (this.subtitleGroups_.tracks[trackName].mode === 'showing') {
+          return this.subtitleGroups_.tracks[trackName];
+        }
+      }
+
+      return null;
+    }
+  }, {
+    key: 'handleSubtitleError_',
+    value: function handleSubtitleError_() {
+      _videoJs2['default'].log.warn('Problem encountered loading the subtitle track' + '. Switching back to default.');
+
+      this.subtitleSegmentLoader_.abort();
+
+      var track = this.activeSubtitleTrack_();
+
+      if (track) {
+        track.mode = 'disabled';
+      }
+
+      this.setupSubtitles();
+    }
+
+    /**
+     * Determine the correct audio renditions based on the active
+     * AudioTrack and initialize a PlaylistLoader and SegmentLoader if
+     * necessary. This method is only called when the media-group changes
+     * and performs non-destructive 'resync' of the SegmentLoader(s) since
+     * the playlist has likely changed
+     */
+  }, {
+    key: 'mediaGroupChanged',
+    value: function mediaGroupChanged() {
+      var track = this.getActiveAudioTrack_();
+
+      this.stopAudioLoaders_();
+      this.resyncAudioLoaders_(track);
+    }
+
+    /**
      * Determine the correct audio rendition based on the active
      * AudioTrack and initialize a PlaylistLoader and SegmentLoader if
      * necessary. This method is called once automatically before
      * playback begins to enable the default audio track and should be
-     * invoked again if the track is changed.
+     * invoked again if the track is changed. Performs destructive 'reset'
+     * on the SegmentLoaders(s) to ensure we start loading audio as
+     * close to currentTime as possible
      */
   }, {
     key: 'setupAudio',
     value: function setupAudio() {
-      var _this4 = this;
+      var track = this.getActiveAudioTrack_();
 
+      this.stopAudioLoaders_();
+      this.resetAudioLoaders_(track);
+    }
+
+    /**
+     * Returns the currently active track or the default track if none
+     * are active
+     */
+  }, {
+    key: 'getActiveAudioTrack_',
+    value: function getActiveAudioTrack_() {
       // determine whether seperate loaders are required for the audio
       // rendition
       var audioGroup = this.activeAudioGroup();
@@ -956,23 +1301,70 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
         track.enabled = true;
       }
 
+      return track;
+    }
+
+    /**
+     * Destroy the PlaylistLoader and pause the SegmentLoader specifically
+     * for audio when switching audio tracks
+     */
+  }, {
+    key: 'stopAudioLoaders_',
+    value: function stopAudioLoaders_() {
       // stop playlist and segment loading for audio
       if (this.audioPlaylistLoader_) {
         this.audioPlaylistLoader_.dispose();
         this.audioPlaylistLoader_ = null;
       }
       this.audioSegmentLoader_.pause();
+    }
 
+    /**
+     * Destructive reset of the mainSegmentLoader (when audio is muxed)
+     * or audioSegmentLoader (when audio is demuxed) to prepare them
+     * to start loading new data right at currentTime
+     */
+  }, {
+    key: 'resetAudioLoaders_',
+    value: function resetAudioLoaders_(track) {
       if (!track.properties_.resolvedUri) {
         this.mainSegmentLoader_.resetEverything();
         return;
       }
+
       this.audioSegmentLoader_.resetEverything();
+      this.setupAudioPlaylistLoader_(track);
+    }
+
+    /**
+     * Non-destructive resync of the audioSegmentLoader (when audio
+     * is demuxed) to prepare to continue appending new audio data
+     * at the end of the current buffered region
+     */
+  }, {
+    key: 'resyncAudioLoaders_',
+    value: function resyncAudioLoaders_(track) {
+      if (!track.properties_.resolvedUri) {
+        return;
+      }
+
+      this.audioSegmentLoader_.resyncLoader();
+      this.setupAudioPlaylistLoader_(track);
+    }
+
+    /**
+     * Setup a new audioPlaylistLoader and start the audioSegmentLoader
+     * to begin loading demuxed audio
+     */
+  }, {
+    key: 'setupAudioPlaylistLoader_',
+    value: function setupAudioPlaylistLoader_(track) {
+      var _this4 = this;
 
       // startup playlist and segment loaders for the enabled audio
       // track
       this.audioPlaylistLoader_ = new _playlistLoader2['default'](track.properties_.resolvedUri, this.hls_, this.withCredentials);
-      this.audioPlaylistLoader_.start();
+      this.audioPlaylistLoader_.load();
 
       this.audioPlaylistLoader_.on('loadedmetadata', function () {
         var audioPlaylist = _this4.audioPlaylistLoader_.media();
@@ -1014,6 +1406,92 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
     }
 
     /**
+     * Determine the correct subtitle playlist based on the active
+     * SubtitleTrack and initialize a PlaylistLoader and SegmentLoader if
+     * necessary. This method is called once automatically before
+     * playback begins to enable the default subtitle track and should be
+     * invoked again if the track is changed.
+     */
+  }, {
+    key: 'setupSubtitles',
+    value: function setupSubtitles() {
+      var _this5 = this;
+
+      var subtitleGroup = this.activeSubtitleGroup_();
+      var track = this.activeSubtitleTrack_();
+
+      this.subtitleSegmentLoader_.pause();
+
+      if (!track) {
+        // stop playlist and segment loading for subtitles
+        if (this.subtitlePlaylistLoader_) {
+          this.subtitlePlaylistLoader_.dispose();
+          this.subtitlePlaylistLoader_ = null;
+        }
+        return;
+      }
+
+      var properties = subtitleGroup.filter(function (subtitleProperties) {
+        return subtitleProperties.id === track.id;
+      })[0];
+
+      // startup playlist and segment loaders for the enabled subtitle track
+      if (!this.subtitlePlaylistLoader_ ||
+      // if the media hasn't loaded yet, we don't have the URI to check, so it is
+      // easiest to simply recreate the playlist loader
+      !this.subtitlePlaylistLoader_.media() || this.subtitlePlaylistLoader_.media().resolvedUri !== properties.resolvedUri) {
+
+        if (this.subtitlePlaylistLoader_) {
+          this.subtitlePlaylistLoader_.dispose();
+        }
+
+        // reset the segment loader only when the subtitle playlist is changed instead of
+        // every time setupSubtitles is called since switching subtitle tracks fires
+        // multiple `change` events on the TextTrackList
+        this.subtitleSegmentLoader_.resetEverything();
+
+        // can't reuse playlistloader because we're only using single renditions and not a
+        // proper master
+        this.subtitlePlaylistLoader_ = new _playlistLoader2['default'](properties.resolvedUri, this.hls_, this.withCredentials);
+
+        this.subtitlePlaylistLoader_.on('loadedmetadata', function () {
+          var subtitlePlaylist = _this5.subtitlePlaylistLoader_.media();
+
+          _this5.subtitleSegmentLoader_.playlist(subtitlePlaylist, _this5.requestOptions_);
+          _this5.subtitleSegmentLoader_.track(_this5.activeSubtitleTrack_());
+
+          // if the video is already playing, or if this isn't a live video and preload
+          // permits, start downloading segments
+          if (!_this5.tech_.paused() || subtitlePlaylist.endList && _this5.tech_.preload() !== 'none') {
+            _this5.subtitleSegmentLoader_.load();
+          }
+        });
+
+        this.subtitlePlaylistLoader_.on('loadedplaylist', function () {
+          var updatedPlaylist = undefined;
+
+          if (_this5.subtitlePlaylistLoader_) {
+            updatedPlaylist = _this5.subtitlePlaylistLoader_.media();
+          }
+
+          if (!updatedPlaylist) {
+            return;
+          }
+
+          _this5.subtitleSegmentLoader_.playlist(updatedPlaylist, _this5.requestOptions_);
+        });
+
+        this.subtitlePlaylistLoader_.on('error', this.handleSubtitleError_.bind(this));
+      }
+
+      if (this.subtitlePlaylistLoader_.media() && this.subtitlePlaylistLoader_.media().resolvedUri === properties.resolvedUri) {
+        this.subtitleSegmentLoader_.load();
+      } else {
+        this.subtitlePlaylistLoader_.load();
+      }
+    }
+
+    /**
      * Re-tune playback quality level for the current player
      * conditions. This method may perform destructive actions, like
      * removing already buffered content, to readjust the currently
@@ -1030,9 +1508,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
         this.masterPlaylistLoader_.media(media);
 
         this.mainSegmentLoader_.resetLoader();
-        if (this.audiosegmentloader_) {
-          this.audioSegmentLoader_.resetLoader();
-        }
+        // don't need to reset audio as it is reset when media changes
       }
     }
 
@@ -1133,6 +1609,68 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
     }
 
     /**
+     * Calls endOfStream on the media source when all active stream types have called
+     * endOfStream
+     *
+     * @param {string} streamType
+     *        Stream type of the segment loader that called endOfStream
+     * @private
+     */
+  }, {
+    key: 'onEndOfStream',
+    value: function onEndOfStream() {
+      var isEndOfStream = this.mainSegmentLoader_.ended_;
+
+      if (this.audioPlaylistLoader_) {
+        // if the audio playlist loader exists, then alternate audio is active, so we need
+        // to wait for both the main and audio segment loaders to call endOfStream
+        isEndOfStream = isEndOfStream && this.audioSegmentLoader_.ended_;
+      }
+
+      if (isEndOfStream) {
+        this.mediaSource.endOfStream();
+      }
+    }
+
+    /**
+     * Check if a playlist has stopped being updated
+     * @param {Object} playlist the media playlist object
+     * @return {boolean} whether the playlist has stopped being updated or not
+     */
+  }, {
+    key: 'stuckAtPlaylistEnd_',
+    value: function stuckAtPlaylistEnd_(playlist) {
+      var seekable = this.seekable();
+
+      if (!seekable.length) {
+        // playlist doesn't have enough information to determine whether we are stuck
+        return false;
+      }
+
+      var expired = this.syncController_.getExpiredTime(playlist, this.mediaSource.duration);
+
+      if (expired === null) {
+        return false;
+      }
+
+      // does not use the safe live end to calculate playlist end, since we
+      // don't want to say we are stuck while there is still content
+      var absolutePlaylistEnd = Hls.Playlist.playlistEnd(playlist, expired);
+      var currentTime = this.tech_.currentTime();
+      var buffered = this.tech_.buffered();
+
+      if (!buffered.length) {
+        // return true if the playhead reached the absolute end of the playlist
+        return absolutePlaylistEnd - currentTime <= _ranges2['default'].TIME_FUDGE_FACTOR;
+      }
+      var bufferedEnd = buffered.end(buffered.length - 1);
+
+      // return true if there is too little buffer left and
+      // buffer has reached absolute end of playlist
+      return bufferedEnd - currentTime <= _ranges2['default'].TIME_FUDGE_FACTOR && absolutePlaylistEnd - bufferedEnd <= _ranges2['default'].TIME_FUDGE_FACTOR;
+    }
+
+    /**
      * Blacklists a playlist when an error occurs for a set amount of time
      * making it unavailable for selection by the rendition selection algorithm
      * and then forces a new playlist (rendition) selection.
@@ -1158,24 +1696,33 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
       // trying to load the master OR while we were disposing of the tech
       if (!currentPlaylist) {
         this.error = error;
-        return this.mediaSource.endOfStream('network');
+
+        try {
+          return this.mediaSource.endOfStream('network');
+        } catch (e) {
+          return this.trigger('error');
+        }
       }
 
+      var isFinalRendition = this.masterPlaylistLoader_.isFinalRendition_();
+
+      if (isFinalRendition) {
+        // Never blacklisting this playlist because it's final rendition
+        _videoJs2['default'].log.warn('Problem encountered with the current ' + 'HLS playlist. Trying again since it is the final playlist.');
+
+        this.tech_.trigger('retryplaylist');
+        return this.masterPlaylistLoader_.load(isFinalRendition);
+      }
       // Blacklist this playlist
-      currentPlaylist.excludeUntil = Date.now() + BLACKLIST_DURATION;
+      currentPlaylist.excludeUntil = Date.now() + this.blacklistDuration * 1000;
+      this.tech_.trigger('blacklistplaylist');
+      this.tech_.trigger({ type: 'usage', name: 'hls-rendition-blacklisted' });
 
       // Select a new playlist
       nextPlaylist = this.selectPlaylist();
+      _videoJs2['default'].log.warn('Problem encountered with the current HLS playlist.' + (error.message ? ' ' + error.message : '') + ' Switching to another playlist.');
 
-      if (nextPlaylist) {
-        _videoJs2['default'].log.warn('Problem encountered with the current ' + 'HLS playlist. Switching to another playlist.');
-
-        return this.masterPlaylistLoader_.media(nextPlaylist);
-      }
-      _videoJs2['default'].log.warn('Problem encountered with the current ' + 'HLS playlist. No suitable alternatives found.');
-      // We have no more playlists we can select so we must fail
-      this.error = error;
-      return this.mediaSource.endOfStream('network');
+      return this.masterPlaylistLoader_.media(nextPlaylist);
     }
 
     /**
@@ -1187,6 +1734,9 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
       this.mainSegmentLoader_.pause();
       if (this.audioPlaylistLoader_) {
         this.audioSegmentLoader_.pause();
+      }
+      if (this.subtitlePlaylistLoader_) {
+        this.subtitleSegmentLoader_.pause();
       }
     }
 
@@ -1230,11 +1780,18 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
         this.audioSegmentLoader_.resetEverything();
         this.audioSegmentLoader_.abort();
       }
+      if (this.subtitlePlaylistLoader_) {
+        this.subtitleSegmentLoader_.resetEverything();
+        this.subtitleSegmentLoader_.abort();
+      }
 
       if (!this.tech_.paused()) {
         this.mainSegmentLoader_.load();
         if (this.audioPlaylistLoader_) {
           this.audioSegmentLoader_.load();
+        }
+        if (this.subtitlePlaylistLoader_) {
+          this.subtitleSegmentLoader_.load();
         }
       }
     }
@@ -1271,7 +1828,6 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
   }, {
     key: 'onSyncInfoUpdate_',
     value: function onSyncInfoUpdate_() {
-      var media = undefined;
       var mainSeekable = undefined;
       var audioSeekable = undefined;
 
@@ -1279,19 +1835,35 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
         return;
       }
 
-      media = this.masterPlaylistLoader_.media();
+      var media = this.masterPlaylistLoader_.media();
 
       if (!media) {
         return;
       }
 
-      mainSeekable = Hls.Playlist.seekable(media);
+      var expired = this.syncController_.getExpiredTime(media, this.mediaSource.duration);
+
+      if (expired === null) {
+        // not enough information to update seekable
+        return;
+      }
+
+      mainSeekable = Hls.Playlist.seekable(media, expired);
+
       if (mainSeekable.length === 0) {
         return;
       }
 
       if (this.audioPlaylistLoader_) {
-        audioSeekable = Hls.Playlist.seekable(this.audioPlaylistLoader_.media());
+        media = this.audioPlaylistLoader_.media();
+        expired = this.syncController_.getExpiredTime(media, this.mediaSource.duration);
+
+        if (expired === null) {
+          return;
+        }
+
+        audioSeekable = Hls.Playlist.seekable(media, expired);
+
         if (audioSeekable.length === 0) {
           return;
         }
@@ -1317,16 +1889,16 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
   }, {
     key: 'updateDuration',
     value: function updateDuration() {
-      var _this5 = this;
+      var _this6 = this;
 
       var oldDuration = this.mediaSource.duration;
       var newDuration = Hls.Playlist.duration(this.masterPlaylistLoader_.media());
       var buffered = this.tech_.buffered();
       var setDuration = function setDuration() {
-        _this5.mediaSource.duration = newDuration;
-        _this5.tech_.trigger('durationchange');
+        _this6.mediaSource.duration = newDuration;
+        _this6.tech_.trigger('durationchange');
 
-        _this5.mediaSource.removeEventListener('sourceopen', setDuration);
+        _this6.mediaSource.removeEventListener('sourceopen', setDuration);
       };
 
       if (buffered.length > 0) {
@@ -1358,7 +1930,11 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
       if (this.audioPlaylistLoader_) {
         this.audioPlaylistLoader_.dispose();
       }
+      if (this.subtitlePlaylistLoader_) {
+        this.subtitlePlaylistLoader_.dispose();
+      }
       this.audioSegmentLoader_.dispose();
+      this.subtitleSegmentLoader_.dispose();
     }
 
     /**
@@ -1484,6 +2060,38 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
 
       _adCueTags2['default'].updateAdCues(media, this.cueTagsTrack_, offset);
     }
+
+    /**
+     * Calculates the desired forward buffer length based on current time
+     *
+     * @return {Number} Desired forward buffer length in seconds
+     */
+  }, {
+    key: 'goalBufferLength',
+    value: function goalBufferLength() {
+      var currentTime = this.tech_.currentTime();
+      var initial = _config2['default'].GOAL_BUFFER_LENGTH;
+      var rate = _config2['default'].GOAL_BUFFER_LENGTH_RATE;
+      var max = Math.max(initial, _config2['default'].MAX_GOAL_BUFFER_LENGTH);
+
+      return Math.min(initial + currentTime * rate, max);
+    }
+
+    /**
+     * Calculates the desired buffer low water line based on current time
+     *
+     * @return {Number} Desired buffer low water line in seconds
+     */
+  }, {
+    key: 'bufferLowWaterLine',
+    value: function bufferLowWaterLine() {
+      var currentTime = this.tech_.currentTime();
+      var initial = _config2['default'].BUFFER_LOW_WATER_LINE;
+      var rate = _config2['default'].BUFFER_LOW_WATER_LINE_RATE;
+      var max = Math.max(initial, _config2['default'].MAX_BUFFER_LOW_WATER_LINE);
+
+      return Math.min(initial + currentTime * rate, max);
+    }
   }]);
 
   return MasterPlaylistController;
@@ -1491,7 +2099,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
 
 exports.MasterPlaylistController = MasterPlaylistController;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./ad-cue-tags":1,"./decrypter-worker":4,"./playlist-loader":8,"./ranges":10,"./segment-loader":14,"./sync-controller":17,"videojs-contrib-media-sources/es5/codec-utils":63,"webworkify":74}],6:[function(require,module,exports){
+},{"./ad-cue-tags":1,"./config":3,"./decrypter-worker":4,"./playlist-loader":8,"./ranges":11,"./segment-loader":15,"./sync-controller":17,"./vtt-segment-loader":18,"videojs-contrib-media-sources/es5/codec-utils":64,"webworkify":75}],6:[function(require,module,exports){
 (function (global){
 'use strict';
 
@@ -1535,7 +2143,8 @@ var byterangeStr = function byterangeStr(byterange) {
 /**
  * Defines headers for use in the xhr request for a particular segment.
  *
- * @param {Object} segment - a simplified copy of the segmentInfo object from SegmentLoader
+ * @param {Object} segment - a simplified copy of the segmentInfo object
+ *                           from SegmentLoader
  */
 var segmentXhrHeaders = function segmentXhrHeaders(segment) {
   var headers = {};
@@ -1547,19 +2156,13 @@ var segmentXhrHeaders = function segmentXhrHeaders(segment) {
 };
 
 /**
- * Abort all requests that have not already returned data
+ * Abort all requests
  *
  * @param {Object} activeXhrs - an object that tracks all XHR requests
  */
 var abortAll = function abortAll(activeXhrs) {
   activeXhrs.forEach(function (xhr) {
-    // only abort xhrs that haven't had a response
-    if (!xhr.responseTime) {
-      // set an aborted property so that we can correctly
-      // track the request and not treat it as an error
-      xhr.aborted = true;
-      xhr.abort();
-    }
+    xhr.abort();
   });
 };
 
@@ -1591,13 +2194,12 @@ var getProgressStats = function getProgressStats(progressEvent) {
     roundTripTime: roundTripTime || 0
   };
 
-  if (progressEvent.lengthComputable) {
-    stats.bytesReceived = progressEvent.loaded;
-    // This can result in Infinity if stats.roundTripTime is 0 but that is ok
-    // because we should only use bandwidth stats on progress to determine when
-    // abort a request early due to insufficient bandwidth
-    stats.bandwidth = Math.floor(stats.bytesReceived / stats.roundTripTime * 8 * 1000);
-  }
+  stats.bytesReceived = progressEvent.loaded;
+  // This can result in Infinity if stats.roundTripTime is 0 but that is ok
+  // because we should only use bandwidth stats on progress to determine when
+  // abort a request early due to insufficient bandwidth
+  stats.bandwidth = Math.floor(stats.bytesReceived / stats.roundTripTime * 8 * 1000);
+
   return stats;
 };
 
@@ -1609,17 +2211,6 @@ var getProgressStats = function getProgressStats(progressEvent) {
  * @param {Object} request -  the XHR request that possibly generated the error
  */
 var handleErrors = function handleErrors(error, request) {
-  var response = request.response;
-
-  if (!request.aborted && error) {
-    return {
-      status: request.status,
-      message: 'HLS request errored at URL: ' + request.uri,
-      code: REQUEST_ERRORS.FAILURE,
-      xhr: request
-    };
-  }
-
   if (request.timedout) {
     return {
       status: request.status,
@@ -1629,11 +2220,20 @@ var handleErrors = function handleErrors(error, request) {
     };
   }
 
-  if (request.aborted || !response || response.byteLength === 0) {
+  if (request.aborted) {
     return {
       status: request.status,
       message: 'HLS request aborted at URL: ' + request.uri,
       code: REQUEST_ERRORS.ABORTED,
+      xhr: request
+    };
+  }
+
+  if (error) {
+    return {
+      status: request.status,
+      message: 'HLS request errored at URL: ' + request.uri,
+      code: REQUEST_ERRORS.FAILURE,
       xhr: request
     };
   }
@@ -1645,7 +2245,8 @@ var handleErrors = function handleErrors(error, request) {
  * Handle responses for key data and convert the key data to the correct format
  * for the decryption step later
  *
- * @param {Object} segment - a simplified copy of the segmentInfo object from SegmentLoader
+ * @param {Object} segment - a simplified copy of the segmentInfo object
+ *                           from SegmentLoader
  * @param {Function} finishProcessingFn - a callback to execute to continue processing
  *                                        this request
  */
@@ -1677,17 +2278,30 @@ var handleKeyResponse = function handleKeyResponse(segment, finishProcessingFn) 
 /**
  * Handle init-segment responses
  *
- * @param {Object} segment - a simplified copy of the segmentInfo object from SegmentLoader
+ * @param {Object} segment - a simplified copy of the segmentInfo object
+ *                           from SegmentLoader
  * @param {Function} finishProcessingFn - a callback to execute to continue processing
  *                                        this request
  */
 var handleInitSegmentResponse = function handleInitSegmentResponse(segment, finishProcessingFn) {
   return function (error, request) {
+    var response = request.response;
     var errorObj = handleErrors(error, request);
 
     if (errorObj) {
       return finishProcessingFn(errorObj, segment);
     }
+
+    // stop processing if received empty content
+    if (response.byteLength === 0) {
+      return finishProcessingFn({
+        status: request.status,
+        message: 'Empty HLS segment content at URL: ' + request.uri,
+        code: REQUEST_ERRORS.FAILURE,
+        xhr: request
+      }, segment);
+    }
+
     segment.map.bytes = new Uint8Array(request.response);
     return finishProcessingFn(null, segment);
   };
@@ -1698,17 +2312,30 @@ var handleInitSegmentResponse = function handleInitSegmentResponse(segment, fini
  * property depending on whether the segment is encryped or not
  * Also records and keeps track of stats that are used for ABR purposes
  *
- * @param {Object} segment - a simplified copy of the segmentInfo object from SegmentLoader
+ * @param {Object} segment - a simplified copy of the segmentInfo object
+ *                           from SegmentLoader
  * @param {Function} finishProcessingFn - a callback to execute to continue processing
  *                                        this request
  */
 var handleSegmentResponse = function handleSegmentResponse(segment, finishProcessingFn) {
   return function (error, request) {
+    var response = request.response;
     var errorObj = handleErrors(error, request);
 
     if (errorObj) {
       return finishProcessingFn(errorObj, segment);
     }
+
+    // stop processing if received empty content
+    if (response.byteLength === 0) {
+      return finishProcessingFn({
+        status: request.status,
+        message: 'Empty HLS segment content at URL: ' + request.uri,
+        code: REQUEST_ERRORS.FAILURE,
+        xhr: request
+      }, segment);
+    }
+
     segment.stats = getRequestStats(request);
 
     if (segment.key) {
@@ -1725,7 +2352,8 @@ var handleSegmentResponse = function handleSegmentResponse(segment, finishProces
  * Decrypt the segment via the decryption web worker
  *
  * @param {WebWorker} decrypter - a WebWorker interface to AES-128 decryption routines
- * @param {Object} segment - a simplified copy of the segmentInfo object from SegmentLoader
+ * @param {Object} segment - a simplified copy of the segmentInfo object
+ *                           from SegmentLoader
  * @param {Function} doneFn - a callback that is executed after decryption has completed
  */
 var decryptSegment = function decryptSegment(decrypter, segment, doneFn) {
@@ -1808,13 +2436,21 @@ var waitForCompletion = function waitForCompletion(activeXhrs, decrypter, doneFn
  * Simple progress event callback handler that gathers some stats before
  * executing a provided callback with the `segment` object
  *
- * @param {Object} segment - a simplified copy of the segmentInfo object from SegmentLoader
- * @param {Function} progressFn - a callback that is executed each time a progress event is received
+ * @param {Object} segment - a simplified copy of the segmentInfo object
+ *                           from SegmentLoader
+ * @param {Function} progressFn - a callback that is executed each time a progress event
+ *                                is received
  * @param {Event} event - the progress event object from XMLHttpRequest
  */
 var handleProgress = function handleProgress(segment, progressFn) {
   return function (event) {
-    segment.stats = getProgressStats(event);
+    segment.stats = _videoJs2['default'].mergeOptions(segment.stats, getProgressStats(event));
+
+    // record the time that we receive the first byte of data
+    if (!segment.stats.firstBytesReceivedAt && segment.stats.bytesReceived) {
+      segment.stats.firstBytesReceivedAt = Date.now();
+    }
+
     return progressFn(event, segment);
   };
 };
@@ -1856,11 +2492,16 @@ var handleProgress = function handleProgress(segment, progressFn) {
  *
  * @param {Function} xhr - an instance of the xhr wrapper in xhr.js
  * @param {Object} xhrOptions - the base options to provide to all xhr requests
- * @param {WebWorker} decryptionWorker - a WebWorker interface to AES-128 decryption routines
- * @param {Object} segment - a simplified copy of the segmentInfo object from SegmentLoader
- * @param {Function} progressFn - a callback that receives progress events from the main segment's xhr request
- * @param {Function} doneFn - a callback that is executed only once all requests have succeeded or failed
- * @returns {Function} a function that, when invoked, immediately aborts all outstanding requests
+ * @param {WebWorker} decryptionWorker - a WebWorker interface to AES-128
+ *                                       decryption routines
+ * @param {Object} segment - a simplified copy of the segmentInfo object
+ *                           from SegmentLoader
+ * @param {Function} progressFn - a callback that receives progress events from the main
+ *                                segment's xhr request
+ * @param {Function} doneFn - a callback that is executed only once all requests have
+ *                            succeeded or failed
+ * @returns {Function} a function that, when invoked, immediately aborts all
+ *                     outstanding requests
  */
 var mediaSegmentRequest = function mediaSegmentRequest(xhr, xhrOptions, decryptionWorker, segment, progressFn, doneFn) {
   var activeXhrs = [];
@@ -1912,7 +2553,14 @@ exports.mediaSegmentRequest = mediaSegmentRequest;
 (function (global){
 /**
  * @file playback-watcher.js
+ *
+ * Playback starts, and now my watch begins. It shall not end until my death. I shall
+ * take no wait, hold no uncleared timeouts, father no bad seeks. I shall wear no crowns
+ * and win no glory. I shall live and die at my post. I am the corrector of the underflow.
+ * I am the watcher of gaps. I am the shield that guards the realms of seekable. I pledge
+ * my life and honor to the Playback Watch, for this Player and all the Players to come.
  */
+
 'use strict';
 
 Object.defineProperty(exports, '__esModule', {
@@ -1924,6 +2572,10 @@ var _createClass = (function () { function defineProperties(target, props) { for
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError('Cannot call a class as a function'); } }
+
+var _globalWindow = require('global/window');
+
+var _globalWindow2 = _interopRequireDefault(_globalWindow);
 
 var _ranges = require('./ranges');
 
@@ -1966,7 +2618,7 @@ var PlaybackWatcher = (function () {
     this.logger_('initialize');
 
     var waitingHandler = function waitingHandler() {
-      return _this.waiting_();
+      return _this.techWaiting_();
     };
     var cancelTimerHandler = function cancelTimerHandler() {
       return _this.cancelTimer_();
@@ -1987,7 +2639,7 @@ var PlaybackWatcher = (function () {
       _this.tech_.off('waiting', waitingHandler);
       _this.tech_.off(timerCancelEvents, cancelTimerHandler);
       if (_this.checkCurrentTimeTimeout_) {
-        clearTimeout(_this.checkCurrentTimeTimeout_);
+        _globalWindow2['default'].clearTimeout(_this.checkCurrentTimeTimeout_);
       }
       _this.cancelTimer_();
     };
@@ -2005,11 +2657,11 @@ var PlaybackWatcher = (function () {
       this.checkCurrentTime_();
 
       if (this.checkCurrentTimeTimeout_) {
-        clearTimeout(this.checkCurrentTimeTimeout_);
+        _globalWindow2['default'].clearTimeout(this.checkCurrentTimeTimeout_);
       }
 
       // 42 = 24 fps // 250 is what Webkit uses // FF uses 15
-      this.checkCurrentTimeTimeout_ = setTimeout(this.monitorCurrentTime_.bind(this), 250);
+      this.checkCurrentTimeTimeout_ = _globalWindow2['default'].setTimeout(this.monitorCurrentTime_.bind(this), 250);
     }
 
     /**
@@ -2033,6 +2685,18 @@ var PlaybackWatcher = (function () {
       }
 
       var currentTime = this.tech_.currentTime();
+      var buffered = this.tech_.buffered();
+
+      if (this.lastRecordedTime === currentTime && (!buffered.length || currentTime + 0.1 >= buffered.end(buffered.length - 1))) {
+        // If current time is at the end of the final buffered region, then any playback
+        // stall is most likely caused by buffering in a low bandwidth environment. The tech
+        // should fire a `waiting` event in this scenario, but due to browser and tech
+        // inconsistencies (e.g. The Flash tech does not fire a `waiting` event when the end
+        // of the buffer is reached and has fallen off the live window). Calling
+        // `techWaiting_` here allows us to simulate responding to a native `waiting` event
+        // when the tech fails to emit one.
+        return this.techWaiting_();
+      }
 
       if (this.consecutiveUpdates >= 5 && currentTime === this.lastRecordedTime) {
         this.consecutiveUpdates++;
@@ -2089,22 +2753,64 @@ var PlaybackWatcher = (function () {
     }
 
     /**
-     * Handler for situations when we determine the player is waiting
+     * Handler for situations when we determine the player is waiting.
      *
      * @private
      */
   }, {
     key: 'waiting_',
     value: function waiting_() {
+      if (this.techWaiting_()) {
+        return;
+      }
+
+      // All tech waiting checks failed. Use last resort correction
+      var currentTime = this.tech_.currentTime();
+      var buffered = this.tech_.buffered();
+      var currentRange = _ranges2['default'].findRange(buffered, currentTime);
+
+      // Sometimes the player can stall for unknown reasons within a contiguous buffered
+      // region with no indication that anything is amiss (seen in Firefox). Seeking to
+      // currentTime is usually enough to kickstart the player. This checks that the player
+      // is currently within a buffered region before attempting a corrective seek.
+      // Chrome does not appear to continue `timeupdate` events after a `waiting` event
+      // until there is ~ 3 seconds of forward buffer available. PlaybackWatcher should also
+      // make sure there is ~3 seconds of forward buffer before taking any corrective action
+      // to avoid triggering an `unknownwaiting` event when the network is slow.
+      if (currentRange.length && currentTime + 3 <= currentRange.end(0)) {
+        this.cancelTimer_();
+        this.tech_.setCurrentTime(currentTime);
+
+        this.logger_('Stopped at ' + currentTime + ' while inside a buffered region ' + ('[' + currentRange.start(0) + ' -> ' + currentRange.end(0) + ']. Attempting to resume ') + 'playback by seeking to the current time.');
+
+        // unknown waiting corrections may be useful for monitoring QoS
+        this.tech_.trigger({ type: 'usage', name: 'hls-unknown-waiting' });
+        return;
+      }
+    }
+
+    /**
+     * Handler for situations when the tech fires a `waiting` event
+     *
+     * @return {Boolean}
+     *         True if an action (or none) was needed to correct the waiting. False if no
+     *         checks passed
+     * @private
+     */
+  }, {
+    key: 'techWaiting_',
+    value: function techWaiting_() {
       var seekable = this.seekable();
       var currentTime = this.tech_.currentTime();
 
       if (this.tech_.seeking() && this.fixesBadSeeks_()) {
-        return;
+        // Tech is seeking or bad seek fixed, no action needed
+        return true;
       }
 
       if (this.tech_.seeking() || this.timer_ !== null) {
-        return;
+        // Tech is seeking or already waiting on another action, no action needed
+        return true;
       }
 
       if (this.fellOutOfLiveWindow_(seekable, currentTime)) {
@@ -2115,8 +2821,8 @@ var PlaybackWatcher = (function () {
         this.tech_.setCurrentTime(livePoint);
 
         // live window resyncs may be useful for monitoring QoS
-        this.tech_.trigger('liveresync');
-        return;
+        this.tech_.trigger({ type: 'usage', name: 'hls-live-resync' });
+        return true;
       }
 
       var buffered = this.tech_.buffered();
@@ -2131,8 +2837,8 @@ var PlaybackWatcher = (function () {
         this.tech_.setCurrentTime(currentTime);
 
         // video underflow may be useful for monitoring QoS
-        this.tech_.trigger('videounderflow');
-        return;
+        this.tech_.trigger({ type: 'usage', name: 'hls-video-underflow' });
+        return true;
       }
 
       // check for gap
@@ -2142,7 +2848,11 @@ var PlaybackWatcher = (function () {
         this.logger_('Stopped at ' + currentTime + ', setting timer for ' + difference + ', seeking ' + ('to ' + nextRange.start(0)));
 
         this.timer_ = setTimeout(this.skipTheGap_.bind(this), difference * 1000, currentTime);
+        return true;
       }
+
+      // All checks failed. Returning false to indicate failure to correct waiting
+      return false;
     }
   }, {
     key: 'outsideOfSeekableWindow_',
@@ -2211,6 +2921,8 @@ var PlaybackWatcher = (function () {
 
       // only seek if we still have not played
       this.tech_.setCurrentTime(nextRange.start(0) + _ranges2['default'].TIME_FUDGE_FACTOR);
+
+      this.tech_.trigger({ type: 'usage', name: 'hls-gap-skip' });
     }
   }, {
     key: 'gapFromVideoUnderflow_',
@@ -2272,7 +2984,7 @@ var PlaybackWatcher = (function () {
 exports['default'] = PlaybackWatcher;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./ranges":10}],8:[function(require,module,exports){
+},{"./ranges":11,"global/window":30}],8:[function(require,module,exports){
 (function (global){
 /**
  * @file playlist-loader.js
@@ -2296,10 +3008,6 @@ var _resolveUrl2 = _interopRequireDefault(_resolveUrl);
 var _videoJs = (typeof window !== "undefined" ? window['videojs'] : typeof global !== "undefined" ? global['videojs'] : null);
 
 var _playlistJs = require('./playlist.js');
-
-var _stream = require('./stream');
-
-var _stream2 = _interopRequireDefault(_stream);
 
 var _m3u8Parser = require('m3u8-parser');
 
@@ -2399,7 +3107,7 @@ var updateMaster = function updateMaster(master, media) {
 };
 
 /**
- * Load a playlist from a remote loacation
+ * Load a playlist from a remote location
  *
  * @class PlaylistLoader
  * @extends Stream
@@ -2413,7 +3121,6 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
   /* eslint-disable consistent-this */
   var loader = this;
   /* eslint-enable consistent-this */
-  var dispose = undefined;
   var mediaUpdateTimeout = undefined;
   var request = undefined;
   var playlistRequestError = undefined;
@@ -2478,6 +3185,7 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
       // if the playlist is unchanged since the last reload,
       // try again after half the target duration
       refreshDelay /= 2;
+      loader.trigger('playlistunchanged');
     }
 
     // refresh live playlists after a target duration passes
@@ -2494,16 +3202,13 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
   // initialize the loader state
   loader.state = 'HAVE_NOTHING';
 
-  // capture the prototype dispose function
-  dispose = this.dispose;
-
   /**
    * Abort any outstanding work and clean up.
    */
   loader.dispose = function () {
     loader.stopRequest();
     _globalWindow2['default'].clearTimeout(mediaUpdateTimeout);
-    dispose.call(this);
+    loader.off();
   };
 
   loader.stopRequest = function () {
@@ -2556,6 +3261,15 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
   };
 
   /**
+   * Returns whether the current playlist is the final available rendition
+   *
+   * @return {Boolean} true if on final rendition
+   */
+  loader.isFinalRendition_ = function () {
+    return loader.master.playlists.filter(_playlistJs.isEnabled).length === 1;
+  };
+
+  /**
    * When called without any arguments, returns the currently
    * active media playlist. When called with a single argument,
    * triggers the playlist loader to asynchronously switch to the
@@ -2563,7 +3277,7 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
    * loader is in the HAVE_NOTHING causes an error to be emitted
    * but otherwise has no effect.
    *
-   * @param {Object=} playlis tthe parsed media playlist
+   * @param {Object=} playlist the parsed media playlist
    * object to switch to
    * @return {Playlist} the current loaded media
    */
@@ -2683,7 +3397,7 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
       }
 
       if (error) {
-        return playlistRequestError(request, loader.media().uri);
+        return playlistRequestError(request, loader.media().uri, 'HAVE_METADATA');
       }
       haveMetadata(request, loader.media().uri);
     });
@@ -2707,20 +3421,37 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
   loader.pause = function () {
     loader.stopRequest();
     _globalWindow2['default'].clearTimeout(mediaUpdateTimeout);
+    if (loader.state === 'HAVE_NOTHING') {
+      // If we pause the loader before any data has been retrieved, its as if we never
+      // started, so reset to an unstarted state.
+      loader.started = false;
+    }
   };
 
   /**
    * start loading of the playlist
    */
-  loader.load = function () {
-    if (loader.started) {
-      if (!loader.media().endList) {
-        loader.trigger('mediaupdatetimeout');
-      } else {
-        loader.trigger('loadedplaylist');
-      }
-    } else {
+  loader.load = function (isFinalRendition) {
+    var media = loader.media();
+
+    _globalWindow2['default'].clearTimeout(mediaUpdateTimeout);
+
+    if (isFinalRendition) {
+      var refreshDelay = media ? media.targetDuration / 2 * 1000 : 5 * 1000;
+
+      mediaUpdateTimeout = _globalWindow2['default'].setTimeout(loader.load.bind(null, false), refreshDelay);
+      return;
+    }
+
+    if (!loader.started) {
       loader.start();
+      return;
+    }
+
+    if (media && !media.endList) {
+      loader.trigger('mediaupdatetimeout');
+    } else {
+      loader.trigger('loadedplaylist');
     }
   };
 
@@ -2755,6 +3486,9 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
           // MEDIA_ERR_NETWORK
           code: 2
         };
+        if (loader.state === 'HAVE_NOTHING') {
+          loader.started = false;
+        }
         return loader.trigger('error');
       }
 
@@ -2779,15 +3513,17 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
         }
 
         // resolve any media group URIs
-        for (var groupKey in loader.master.mediaGroups.AUDIO) {
-          for (var labelKey in loader.master.mediaGroups.AUDIO[groupKey]) {
-            var alternateAudio = loader.master.mediaGroups.AUDIO[groupKey][labelKey];
+        ['AUDIO', 'SUBTITLES'].forEach(function (mediaType) {
+          for (var groupKey in loader.master.mediaGroups[mediaType]) {
+            for (var labelKey in loader.master.mediaGroups[mediaType][groupKey]) {
+              var mediaProperties = loader.master.mediaGroups[mediaType][groupKey][labelKey];
 
-            if (alternateAudio.uri) {
-              alternateAudio.resolvedUri = (0, _resolveUrl2['default'])(loader.master.uri, alternateAudio.uri);
+              if (mediaProperties.uri) {
+                mediaProperties.resolvedUri = (0, _resolveUrl2['default'])(loader.master.uri, mediaProperties.uri);
+              }
             }
           }
-        }
+        });
 
         loader.trigger('loadedplaylist');
         if (!request) {
@@ -2820,12 +3556,371 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
   };
 };
 
-PlaylistLoader.prototype = new _stream2['default']();
+PlaylistLoader.prototype = new _videoJs.EventTarget();
 
 exports['default'] = PlaylistLoader;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./playlist.js":9,"./resolve-url":13,"./stream":16,"global/window":29,"m3u8-parser":30}],9:[function(require,module,exports){
+},{"./playlist.js":10,"./resolve-url":14,"global/window":30,"m3u8-parser":31}],9:[function(require,module,exports){
+'use strict';
+
+Object.defineProperty(exports, '__esModule', {
+  value: true
+});
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
+
+var _config = require('./config');
+
+var _config2 = _interopRequireDefault(_config);
+
+var _playlist = require('./playlist');
+
+var _playlist2 = _interopRequireDefault(_playlist);
+
+// Utilities
+
+/**
+ * Returns the CSS value for the specified property on an element
+ * using `getComputedStyle`. Firefox has a long-standing issue where
+ * getComputedStyle() may return null when running in an iframe with
+ * `display: none`.
+ *
+ * @see https://bugzilla.mozilla.org/show_bug.cgi?id=548397
+ * @param {HTMLElement} el the htmlelement to work on
+ * @param {string} the proprety to get the style for
+ */
+var safeGetComputedStyle = function safeGetComputedStyle(el, property) {
+  var result = undefined;
+
+  if (!el) {
+    return '';
+  }
+
+  result = window.getComputedStyle(el);
+  if (!result) {
+    return '';
+  }
+
+  return result[property];
+};
+
+/**
+ * Resuable stable sort function
+ *
+ * @param {Playlists} array
+ * @param {Function} sortFn Different comparators
+ * @function stableSort
+ */
+var stableSort = function stableSort(array, sortFn) {
+  var newArray = array.slice();
+
+  array.sort(function (left, right) {
+    var cmp = sortFn(left, right);
+
+    if (cmp === 0) {
+      return newArray.indexOf(left) - newArray.indexOf(right);
+    }
+    return cmp;
+  });
+};
+
+/**
+ * A comparator function to sort two playlist object by bandwidth.
+ *
+ * @param {Object} left a media playlist object
+ * @param {Object} right a media playlist object
+ * @return {Number} Greater than zero if the bandwidth attribute of
+ * left is greater than the corresponding attribute of right. Less
+ * than zero if the bandwidth of right is greater than left and
+ * exactly zero if the two are equal.
+ */
+var comparePlaylistBandwidth = function comparePlaylistBandwidth(left, right) {
+  var leftBandwidth = undefined;
+  var rightBandwidth = undefined;
+
+  if (left.attributes && left.attributes.BANDWIDTH) {
+    leftBandwidth = left.attributes.BANDWIDTH;
+  }
+  leftBandwidth = leftBandwidth || window.Number.MAX_VALUE;
+  if (right.attributes && right.attributes.BANDWIDTH) {
+    rightBandwidth = right.attributes.BANDWIDTH;
+  }
+  rightBandwidth = rightBandwidth || window.Number.MAX_VALUE;
+
+  return leftBandwidth - rightBandwidth;
+};
+
+exports.comparePlaylistBandwidth = comparePlaylistBandwidth;
+/**
+ * A comparator function to sort two playlist object by resolution (width).
+ * @param {Object} left a media playlist object
+ * @param {Object} right a media playlist object
+ * @return {Number} Greater than zero if the resolution.width attribute of
+ * left is greater than the corresponding attribute of right. Less
+ * than zero if the resolution.width of right is greater than left and
+ * exactly zero if the two are equal.
+ */
+var comparePlaylistResolution = function comparePlaylistResolution(left, right) {
+  var leftWidth = undefined;
+  var rightWidth = undefined;
+
+  if (left.attributes && left.attributes.RESOLUTION && left.attributes.RESOLUTION.width) {
+    leftWidth = left.attributes.RESOLUTION.width;
+  }
+
+  leftWidth = leftWidth || window.Number.MAX_VALUE;
+
+  if (right.attributes && right.attributes.RESOLUTION && right.attributes.RESOLUTION.width) {
+    rightWidth = right.attributes.RESOLUTION.width;
+  }
+
+  rightWidth = rightWidth || window.Number.MAX_VALUE;
+
+  // NOTE - Fallback to bandwidth sort as appropriate in cases where multiple renditions
+  // have the same media dimensions/ resolution
+  if (leftWidth === rightWidth && left.attributes.BANDWIDTH && right.attributes.BANDWIDTH) {
+    return left.attributes.BANDWIDTH - right.attributes.BANDWIDTH;
+  }
+  return leftWidth - rightWidth;
+};
+
+exports.comparePlaylistResolution = comparePlaylistResolution;
+/**
+ * Chooses the appropriate media playlist based on bandwidth and player size
+ *
+ * @param {Object} master
+ *        Object representation of the master manifest
+ * @param {Number} playerBandwidth
+ *        Current calculated bandwidth of the player
+ * @param {Number} playerWidth
+ *        Current width of the player element
+ * @param {Number} playerHeight
+ *        Current height of the player element
+ * @return {Playlist} the highest bitrate playlist less than the
+ * currently detected bandwidth, accounting for some amount of
+ * bandwidth variance
+ */
+var simpleSelector = function simpleSelector(master, playerBandwidth, playerWidth, playerHeight) {
+  // convert the playlists to an intermediary representation to make comparisons easier
+  var sortedPlaylistReps = master.playlists.map(function (playlist) {
+    var width = undefined;
+    var height = undefined;
+    var bandwidth = undefined;
+
+    if (playlist.attributes) {
+      width = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.width;
+      height = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.height;
+      bandwidth = playlist.attributes.BANDWIDTH;
+    }
+
+    bandwidth = bandwidth || window.Number.MAX_VALUE;
+
+    return {
+      bandwidth: bandwidth,
+      width: width,
+      height: height,
+      playlist: playlist
+    };
+  });
+
+  stableSort(sortedPlaylistReps, function (left, right) {
+    return left.bandwidth - right.bandwidth;
+  });
+
+  // filter out any playlists that have been excluded due to
+  // incompatible configurations or playback errors
+  sortedPlaylistReps = sortedPlaylistReps.filter(function (rep) {
+    return _playlist2['default'].isEnabled(rep.playlist);
+  });
+
+  // filter out any variant that has greater effective bitrate
+  // than the current estimated bandwidth
+  var bandwidthPlaylistReps = sortedPlaylistReps.filter(function (rep) {
+    return rep.bandwidth * _config2['default'].BANDWIDTH_VARIANCE < playerBandwidth;
+  });
+
+  var highestRemainingBandwidthRep = bandwidthPlaylistReps[bandwidthPlaylistReps.length - 1];
+
+  // get all of the renditions with the same (highest) bandwidth
+  // and then taking the very first element
+  var bandwidthBestRep = bandwidthPlaylistReps.filter(function (rep) {
+    return rep.bandwidth === highestRemainingBandwidthRep.bandwidth;
+  })[0];
+
+  // filter out playlists without resolution information
+  var haveResolution = bandwidthPlaylistReps.filter(function (rep) {
+    return rep.width && rep.height;
+  });
+
+  // sort variants by resolution
+  stableSort(haveResolution, function (left, right) {
+    return left.width - right.width;
+  });
+
+  // if we have the exact resolution as the player use it
+  var resolutionBestRepList = haveResolution.filter(function (rep) {
+    return rep.width === playerWidth && rep.height === playerHeight;
+  });
+
+  highestRemainingBandwidthRep = resolutionBestRepList[resolutionBestRepList.length - 1];
+  // ensure that we pick the highest bandwidth variant that have exact resolution
+  var resolutionBestRep = resolutionBestRepList.filter(function (rep) {
+    return rep.bandwidth === highestRemainingBandwidthRep.bandwidth;
+  })[0];
+
+  var resolutionPlusOneList = undefined;
+  var resolutionPlusOneSmallest = undefined;
+  var resolutionPlusOneRep = undefined;
+
+  // find the smallest variant that is larger than the player
+  // if there is no match of exact resolution
+  if (!resolutionBestRep) {
+    resolutionPlusOneList = haveResolution.filter(function (rep) {
+      return rep.width > playerWidth || rep.height > playerHeight;
+    });
+
+    // find all the variants have the same smallest resolution
+    resolutionPlusOneSmallest = resolutionPlusOneList.filter(function (rep) {
+      return rep.width === resolutionPlusOneList[0].width && rep.height === resolutionPlusOneList[0].height;
+    });
+
+    // ensure that we also pick the highest bandwidth variant that
+    // is just-larger-than the video player
+    highestRemainingBandwidthRep = resolutionPlusOneSmallest[resolutionPlusOneSmallest.length - 1];
+    resolutionPlusOneRep = resolutionPlusOneSmallest.filter(function (rep) {
+      return rep.bandwidth === highestRemainingBandwidthRep.bandwidth;
+    })[0];
+  }
+
+  // fallback chain of variants
+  return (resolutionPlusOneRep || resolutionBestRep || bandwidthBestRep || sortedPlaylistReps[0]).playlist;
+};
+
+// Playlist Selectors
+
+/**
+ * Chooses the appropriate media playlist based on the most recent
+ * bandwidth estimate and the player size.
+ *
+ * Expects to be called within the context of an instance of HlsHandler
+ *
+ * @return {Playlist} the highest bitrate playlist less than the
+ * currently detected bandwidth, accounting for some amount of
+ * bandwidth variance
+ */
+var lastBandwidthSelector = function lastBandwidthSelector() {
+  return simpleSelector(this.playlists.master, this.systemBandwidth, parseInt(safeGetComputedStyle(this.tech_.el(), 'width'), 10), parseInt(safeGetComputedStyle(this.tech_.el(), 'height'), 10));
+};
+
+exports.lastBandwidthSelector = lastBandwidthSelector;
+/**
+ * Chooses the appropriate media playlist based on an
+ * exponential-weighted moving average of the bandwidth after
+ * filtering for player size.
+ *
+ * Expects to be called within the context of an instance of HlsHandler
+ *
+ * @param {Number} decay - a number between 0 and 1. Higher values of
+ * this parameter will cause previous bandwidth estimates to lose
+ * significance more quickly.
+ * @return {Function} a function which can be invoked to create a new
+ * playlist selector function.
+ * @see https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average
+ */
+var movingAverageBandwidthSelector = function movingAverageBandwidthSelector(decay) {
+  var average = -1;
+
+  if (decay < 0 || decay > 1) {
+    throw new Error('Moving average bandwidth decay must be between 0 and 1.');
+  }
+
+  return function () {
+    if (average < 0) {
+      average = this.systemBandwidth;
+    }
+
+    average = decay * this.systemBandwidth + (1 - decay) * average;
+    return simpleSelector(this.playlists.master, average, parseInt(safeGetComputedStyle(this.tech_.el(), 'width'), 10), parseInt(safeGetComputedStyle(this.tech_.el(), 'height'), 10));
+  };
+};
+
+exports.movingAverageBandwidthSelector = movingAverageBandwidthSelector;
+/**
+ * Chooses the appropriate media playlist based on the potential to rebuffer
+ *
+ * @param {Object} settings
+ *        Object of information required to use this selector
+ * @param {Object} settings.master
+ *        Object representation of the master manifest
+ * @param {Number} settings.currentTime
+ *        The current time of the player
+ * @param {Number} settings.bandwidth
+ *        Current measured bandwidth
+ * @param {Number} settings.duration
+ *        Duration of the media
+ * @param {Number} settings.segmentDuration
+ *        Segment duration to be used in round trip time calculations
+ * @param {Number} settings.timeUntilRebuffer
+ *        Time left in seconds until the player has to rebuffer
+ * @param {Number} settings.currentTimeline
+ *        The current timeline segments are being loaded from
+ * @param {SyncController} settings.syncController
+ *        SyncController for determining if we have a sync point for a given playlist
+ * @return {Object|null}
+ *         {Object} return.playlist
+ *         The highest bandwidth playlist with the least amount of rebuffering
+ *         {Number} return.rebufferingImpact
+ *         The amount of time in seconds switching to this playlist will rebuffer. A
+ *         negative value means that switching will cause zero rebuffering.
+ */
+var minRebufferMaxBandwidthSelector = function minRebufferMaxBandwidthSelector(settings) {
+  var master = settings.master;
+  var currentTime = settings.currentTime;
+  var bandwidth = settings.bandwidth;
+  var duration = settings.duration;
+  var segmentDuration = settings.segmentDuration;
+  var timeUntilRebuffer = settings.timeUntilRebuffer;
+  var currentTimeline = settings.currentTimeline;
+  var syncController = settings.syncController;
+
+  var bandwidthPlaylists = master.playlists.filter(_playlist2['default'].hasAttribute.bind(null, 'BANDWIDTH'));
+
+  var rebufferingEstimates = bandwidthPlaylists.map(function (playlist) {
+    var syncPoint = syncController.getSyncPoint(playlist, duration, currentTimeline, currentTime);
+    // If there is no sync point for this playlist, switching to it will require a
+    // sync request first. This will double the request time
+    var numRequests = syncPoint ? 1 : 2;
+    var requestTimeEstimate = _playlist2['default'].estimateSegmentRequestTime(segmentDuration, bandwidth, playlist);
+    var rebufferingImpact = requestTimeEstimate * numRequests - timeUntilRebuffer;
+
+    return {
+      playlist: playlist,
+      rebufferingImpact: rebufferingImpact
+    };
+  });
+
+  var noRebufferingPlaylists = rebufferingEstimates.filter(function (estimate) {
+    return estimate.rebufferingImpact <= 0;
+  });
+
+  // Sort by bandwidth DESC
+  stableSort(noRebufferingPlaylists, function (a, b) {
+    return comparePlaylistBandwidth(b.playlist, a.playlist);
+  });
+
+  if (noRebufferingPlaylists.length) {
+    return noRebufferingPlaylists[0];
+  }
+
+  stableSort(rebufferingEstimates, function (a, b) {
+    return a.rebufferingImpact - b.rebufferingImpact;
+  });
+
+  return rebufferingEstimates[0] || null;
+};
+exports.minRebufferMaxBandwidthSelector = minRebufferMaxBandwidthSelector;
+},{"./config":3,"./playlist":10}],10:[function(require,module,exports){
 (function (global){
 /**
  * @file playlist.js
@@ -3061,93 +4156,38 @@ var sumDurations = function sumDurations(playlist, startIndex, endIndex) {
 
 exports.sumDurations = sumDurations;
 /**
- * Returns an array with two sync points. The first being an expired sync point, which is
- * the most recent segment with timing sync data that has fallen off the playlist. The
- * second is a segment sync point, which is the first segment that has timing sync data in
- * the current playlist.
+ * Calculates the playlist end time
  *
  * @param {Object} playlist a media playlist object
- * @returns {Object} an object containing the two sync points
- * @returns {Object.expiredSync|null} sync point data from an expired segment
- * @returns {Object.segmentSync|null} sync point data from a segment in the playlist
- * @function getPlaylistSyncPoints
+ * @param {Number=} expired the amount of time that has
+ *                  dropped off the front of the playlist in a live scenario
+ * @param {Boolean|false} useSafeLiveEnd a boolean value indicating whether or not the
+ *                        playlist end calculation should consider the safe live end
+ *                        (truncate the playlist end by three segments). This is normally
+ *                        used for calculating the end of the playlist's seekable range.
+ * @returns {Number} the end time of playlist
+ * @function playlistEnd
  */
-var getPlaylistSyncPoints = function getPlaylistSyncPoints(playlist) {
+var playlistEnd = function playlistEnd(playlist, expired, useSafeLiveEnd) {
   if (!playlist || !playlist.segments) {
-    return [null, null];
+    return null;
+  }
+  if (playlist.endList) {
+    return duration(playlist);
   }
 
-  var expiredSync = playlist.syncInfo || null;
-
-  var segmentSync = null;
-
-  // Find the first segment with timing information
-  for (var i = 0, l = playlist.segments.length; i < l; i++) {
-    var segment = playlist.segments[i];
-
-    if (typeof segment.start !== 'undefined') {
-      segmentSync = {
-        mediaSequence: playlist.mediaSequence + i,
-        time: segment.start
-      };
-      break;
-    }
+  if (expired === null) {
+    return null;
   }
 
-  return { expiredSync: expiredSync, segmentSync: segmentSync };
+  expired = expired || 0;
+
+  var endSequence = useSafeLiveEnd ? Math.max(0, playlist.segments.length - Playlist.UNSAFE_LIVE_SEGMENTS) : Math.max(0, playlist.segments.length);
+
+  return intervalDuration(playlist, playlist.mediaSequence + endSequence, expired);
 };
 
-/**
- * Calculates the amount of time expired from the playlist based on the provided
- * sync points.
- *
- * @param {Object} playlist a media playlist object
- * @param {Object|null} expiredSync sync point representing most recent segment with
- *                                  timing sync data that has fallen off the playlist
- * @param {Object|null} segmentSync sync point representing the first segment that has
- *                                  timing sync data in the playlist
- * @returns {Number} the amount of time expired from the playlist
- * @function calculateExpiredTime
- */
-var calculateExpiredTime = function calculateExpiredTime(playlist, expiredSync, segmentSync) {
-  // If we have both an expired sync point and a segment sync point
-  // determine which sync point is closest to the start of the playlist
-  // so the minimal amount of timing estimation is done.
-  if (expiredSync && segmentSync) {
-    var expiredDiff = expiredSync.mediaSequence - playlist.mediaSequence;
-    var segmentDiff = segmentSync.mediaSequence - playlist.mediaSequence;
-    var syncIndex = undefined;
-    var syncTime = undefined;
-
-    if (Math.abs(expiredDiff) > Math.abs(segmentDiff)) {
-      syncIndex = segmentDiff;
-      syncTime = -segmentSync.time;
-    } else {
-      syncIndex = expiredDiff;
-      syncTime = expiredSync.time;
-    }
-
-    return Math.abs(syncTime + sumDurations(playlist, syncIndex, 0));
-  }
-
-  // We only have an expired sync point, so base expired time on the expired sync point
-  // and estimate the time from that sync point to the start of the playlist.
-  if (expiredSync) {
-    var syncIndex = expiredSync.mediaSequence - playlist.mediaSequence;
-
-    return expiredSync.time + sumDurations(playlist, syncIndex, 0);
-  }
-
-  // We only have a segment sync point, so base expired time on the first segment we have
-  // sync point data for and estimate the time from that media index to the start of the
-  // playlist.
-  if (segmentSync) {
-    var syncIndex = segmentSync.mediaSequence - playlist.mediaSequence;
-
-    return segmentSync.time - sumDurations(playlist, syncIndex, 0);
-  }
-};
-
+exports.playlistEnd = playlistEnd;
 /**
   * Calculates the interval of time that is currently seekable in a
   * playlist. The returned time ranges are relative to the earliest
@@ -3158,39 +4198,20 @@ var calculateExpiredTime = function calculateExpiredTime(playlist, expiredSync, 
   *
   * @param {Object} playlist a media playlist object
   * dropped off the front of the playlist in a live scenario
+  * @param {Number=} expired the amount of time that has
+  * dropped off the front of the playlist in a live scenario
   * @return {TimeRanges} the periods of time that are valid targets
   * for seeking
   */
-var seekable = function seekable(playlist) {
-  // without segments, there are no seekable ranges
-  if (!playlist || !playlist.segments) {
+var seekable = function seekable(playlist, expired) {
+  var useSafeLiveEnd = true;
+  var seekableStart = expired || 0;
+  var seekableEnd = playlistEnd(playlist, expired, useSafeLiveEnd);
+
+  if (seekableEnd === null) {
     return (0, _videoJs.createTimeRange)();
   }
-  // when the playlist is complete, the entire duration is seekable
-  if (playlist.endList) {
-    return (0, _videoJs.createTimeRange)(0, duration(playlist));
-  }
-
-  var _getPlaylistSyncPoints = getPlaylistSyncPoints(playlist);
-
-  var expiredSync = _getPlaylistSyncPoints.expiredSync;
-  var segmentSync = _getPlaylistSyncPoints.segmentSync;
-
-  // We have no sync information for this playlist so we can't create a seekable range
-  if (!expiredSync && !segmentSync) {
-    return (0, _videoJs.createTimeRange)();
-  }
-
-  var expired = calculateExpiredTime(playlist, expiredSync, segmentSync);
-
-  // live playlists should not expose three segment durations worth
-  // of content from the end of the playlist
-  // https://tools.ietf.org/html/draft-pantos-http-live-streaming-16#section-6.3.3
-  var start = expired;
-  var endSequence = Math.max(0, playlist.segments.length - Playlist.UNSAFE_LIVE_SEGMENTS);
-  var end = intervalDuration(playlist, playlist.mediaSequence + endSequence, expired);
-
-  return (0, _videoJs.createTimeRange)(start, end);
+  return (0, _videoJs.createTimeRange)(seekableStart, seekableEnd);
 };
 
 exports.seekable = seekable;
@@ -3230,7 +4251,7 @@ var floorLeastSignificantDigit = roundSignificantDigit.bind(null, -1);
  * @param {Number} startTime
  * @return {Object}
  */
-var getMediaInfoForTime_ = function getMediaInfoForTime_(playlist, currentTime, startIndex, startTime) {
+var getMediaInfoForTime = function getMediaInfoForTime(playlist, currentTime, startIndex, startTime) {
   var i = undefined;
   var segment = undefined;
   var numSegments = playlist.segments.length;
@@ -3296,7 +4317,7 @@ var getMediaInfoForTime_ = function getMediaInfoForTime_(playlist, currentTime, 
   };
 };
 
-exports.getMediaInfoForTime_ = getMediaInfoForTime_;
+exports.getMediaInfoForTime = getMediaInfoForTime;
 /**
  * Check whether the playlist is blacklisted or not.
  *
@@ -3323,16 +4344,96 @@ var isEnabled = function isEnabled(playlist) {
 };
 
 exports.isEnabled = isEnabled;
+/**
+ * Returns whether the current playlist is an AES encrypted HLS stream
+ *
+ * @return {Boolean} true if it's an AES encrypted HLS stream
+ */
+var isAes = function isAes(media) {
+  for (var i = 0; i < media.segments.length; i++) {
+    if (media.segments[i].key) {
+      return true;
+    }
+  }
+  return false;
+};
+
+exports.isAes = isAes;
+/**
+ * Returns whether the current playlist contains fMP4
+ *
+ * @return {Boolean} true if the playlist contains fMP4
+ */
+var isFmp4 = function isFmp4(media) {
+  for (var i = 0; i < media.segments.length; i++) {
+    if (media.segments[i].map) {
+      return true;
+    }
+  }
+  return false;
+};
+
+exports.isFmp4 = isFmp4;
+/**
+ * Checks if the playlist has a value for the specified attribute
+ *
+ * @param {String} attr
+ *        Attribute to check for
+ * @param {Object} playlist
+ *        The media playlist object
+ * @return {Boolean}
+ *         Whether the playlist contains a value for the attribute or not
+ * @function hasAttribute
+ */
+var hasAttribute = function hasAttribute(attr, playlist) {
+  return playlist.attributes && playlist.attributes[attr];
+};
+
+exports.hasAttribute = hasAttribute;
+/**
+ * Estimates the time required to complete a segment download from the specified playlist
+ *
+ * @param {Number} segmentDuration
+ *        Duration of requested segment
+ * @param {Number} bandwidth
+ *        Current measured bandwidth of the player
+ * @param {Object} playlist
+ *        The media playlist object
+ * @param {Number=} bytesReceived
+ *        Number of bytes already received for the request. Defaults to 0
+ * @return {Number|NaN}
+ *         The estimated time to request the segment. NaN if bandwidth information for
+ *         the given playlist is unavailable
+ * @function estimateSegmentRequestTime
+ */
+var estimateSegmentRequestTime = function estimateSegmentRequestTime(segmentDuration, bandwidth, playlist) {
+  var bytesReceived = arguments.length <= 3 || arguments[3] === undefined ? 0 : arguments[3];
+
+  if (!hasAttribute('BANDWIDTH', playlist)) {
+    return NaN;
+  }
+
+  var size = segmentDuration * playlist.attributes.BANDWIDTH;
+
+  return (size - bytesReceived * 8) / bandwidth;
+};
+
+exports.estimateSegmentRequestTime = estimateSegmentRequestTime;
 Playlist.duration = duration;
 Playlist.seekable = seekable;
-Playlist.getMediaInfoForTime_ = getMediaInfoForTime_;
+Playlist.getMediaInfoForTime = getMediaInfoForTime;
 Playlist.isEnabled = isEnabled;
 Playlist.isBlacklisted = isBlacklisted;
+Playlist.playlistEnd = playlistEnd;
+Playlist.isAes = isAes;
+Playlist.isFmp4 = isFmp4;
+Playlist.hasAttribute = hasAttribute;
+Playlist.estimateSegmentRequestTime = estimateSegmentRequestTime;
 
 // exports
 exports['default'] = Playlist;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"global/window":29}],10:[function(require,module,exports){
+},{"global/window":30}],11:[function(require,module,exports){
 (function (global){
 /**
  * ranges
@@ -3673,6 +4774,28 @@ var printableRange = function printableRange(range) {
   return strArr.join(', ');
 };
 
+/**
+ * Calculates the amount of time left in seconds until the player hits the end of the
+ * buffer and causes a rebuffer
+ *
+ * @param {TimeRange} buffered
+ *        The state of the buffer
+ * @param {Numnber} currentTime
+ *        The current time of the player
+ * @param {Number} playbackRate
+ *        The current playback rate of the player. Defaults to 1.
+ * @return {Number}
+ *         Time until the player has to start rebuffering in seconds.
+ * @function timeUntilRebuffer
+ */
+var timeUntilRebuffer = function timeUntilRebuffer(buffered, currentTime) {
+  var playbackRate = arguments.length <= 2 || arguments[2] === undefined ? 1 : arguments[2];
+
+  var bufferedEnd = buffered.length ? buffered.end(buffered.length - 1) : 0;
+
+  return (bufferedEnd - currentTime) / playbackRate;
+};
+
 exports['default'] = {
   findRange: findRange,
   findNextRange: findNextRange,
@@ -3680,11 +4803,12 @@ exports['default'] = {
   findSoleUncommonTimeRangesEnd: findSoleUncommonTimeRangesEnd,
   getSegmentBufferedPercent: getSegmentBufferedPercent,
   TIME_FUDGE_FACTOR: TIME_FUDGE_FACTOR,
-  printableRange: printableRange
+  printableRange: printableRange,
+  timeUntilRebuffer: timeUntilRebuffer
 };
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],11:[function(require,module,exports){
+},{}],12:[function(require,module,exports){
 (function (global){
 'use strict';
 
@@ -3720,6 +4844,10 @@ var initPlugin = function initPlugin(player, options) {
   var seekTo = 0;
   var localOptions = _videoJs2['default'].mergeOptions(defaultOptions, options);
 
+  player.ready(function () {
+    player.trigger({ type: 'usage', name: 'hls-error-reload-initialized' });
+  });
+
   /**
    * Player modifications to perform that must wait until `loadedmetadata`
    * has been triggered
@@ -3747,6 +4875,7 @@ var initPlugin = function initPlugin(player, options) {
     player.one('loadedmetadata', loadedMetadataHandler);
 
     player.src(sourceObj);
+    player.trigger({ type: 'usage', name: 'hls-error-reload' });
     player.play();
   };
 
@@ -3760,6 +4889,7 @@ var initPlugin = function initPlugin(player, options) {
     // Do not attempt to reload the source if a source-reload occurred before
     // 'errorInterval' time has elapsed since the last source-reload
     if (Date.now() - lastCalled < localOptions.errorInterval * 1000) {
+      player.trigger({ type: 'usage', name: 'hls-error-reload-canceled' });
       return;
     }
 
@@ -3815,7 +4945,7 @@ var reloadSourceOnError = function reloadSourceOnError(options) {
 exports['default'] = reloadSourceOnError;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],12:[function(require,module,exports){
+},{}],13:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, '__esModule', {
@@ -3857,8 +4987,12 @@ var enableFunction = function enableFunction(loader, playlistUri, changePlaylist
   if (enable !== currentlyEnabled && !blacklisted) {
     // Ensure the outside world knows about our changes
     changePlaylistFn();
+    if (enable) {
+      loader.trigger('renditionenabled');
+    } else {
+      loader.trigger('renditiondisabled');
+    }
   }
-
   return enable;
 };
 
@@ -3923,7 +5057,7 @@ var renditionSelectionMixin = function renditionSelectionMixin(hlsHandler) {
 
 exports['default'] = renditionSelectionMixin;
 module.exports = exports['default'];
-},{"./playlist.js":9}],13:[function(require,module,exports){
+},{"./playlist.js":10}],14:[function(require,module,exports){
 /**
  * @file resolve-url.js
  */
@@ -3960,7 +5094,7 @@ var resolveUrl = function resolveUrl(baseURL, relativeURL) {
 
 exports['default'] = resolveUrl;
 module.exports = exports['default'];
-},{"global/window":29,"url-toolkit":60}],14:[function(require,module,exports){
+},{"global/window":30,"url-toolkit":61}],15:[function(require,module,exports){
 (function (global){
 /**
  * @file segment-loader.js
@@ -3973,7 +5107,7 @@ Object.defineProperty(exports, '__esModule', {
 
 var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ('value' in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
 
-var _get = function get(_x2, _x3, _x4) { var _again = true; _function: while (_again) { var object = _x2, property = _x3, receiver = _x4; _again = false; if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { _x2 = parent; _x3 = property; _x4 = receiver; _again = true; desc = parent = undefined; continue _function; } } else if ('value' in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } } };
+var _get = function get(_x4, _x5, _x6) { var _again = true; _function: while (_again) { var object = _x4, property = _x5, receiver = _x6; _again = false; if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { _x4 = parent; _x5 = property; _x6 = receiver; _again = true; desc = parent = undefined; continue _function; } } else if ('value' in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } } };
 
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
 
@@ -3982,6 +5116,8 @@ function _classCallCheck(instance, Constructor) { if (!(instance instanceof Cons
 function _inherits(subClass, superClass) { if (typeof superClass !== 'function' && superClass !== null) { throw new TypeError('Super expression must either be null or a function, not ' + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
 
 var _playlist = require('./playlist');
+
+var _playlist2 = _interopRequireDefault(_playlist);
 
 var _videoJs = (typeof window !== "undefined" ? window['videojs'] : typeof global !== "undefined" ? global['videojs'] : null);
 
@@ -4003,7 +5139,13 @@ var _videojsContribMediaSourcesEs5RemoveCuesFromTrackJs = require('videojs-contr
 
 var _videojsContribMediaSourcesEs5RemoveCuesFromTrackJs2 = _interopRequireDefault(_videojsContribMediaSourcesEs5RemoveCuesFromTrackJs);
 
+var _binUtils = require('./bin-utils');
+
 var _mediaSegmentRequest = require('./media-segment-request');
+
+var _ranges = require('./ranges');
+
+var _playlistSelectors = require('./playlist-selectors');
 
 // in ms
 var CHECK_BUFFER_DELAY = 500;
@@ -4019,7 +5161,7 @@ var CHECK_BUFFER_DELAY = 500;
  * @returns {Boolean} do we need to call endOfStream on the MediaSource
  */
 var detectEndOfStream = function detectEndOfStream(playlist, mediaSource, segmentIndex) {
-  if (!playlist) {
+  if (!playlist || !mediaSource) {
     return false;
   }
 
@@ -4035,17 +5177,8 @@ var detectEndOfStream = function detectEndOfStream(playlist, mediaSource, segmen
   return playlist.endList && mediaSource.readyState === 'open' && appendedLastSegment;
 };
 
-/**
- * Returns a unique string identifier for a media initialization
- * segment.
- */
-var initSegmentId = function initSegmentId(initSegment) {
-  var byterange = initSegment.byterange || {
-    length: Infinity,
-    offset: 0
-  };
-
-  return [byterange.length, byterange.offset, initSegment.resolvedUri].join(',');
+var finite = function finite(num) {
+  return typeof num === 'number' && isFinite(num);
 };
 
 /**
@@ -4059,24 +5192,24 @@ var initSegmentId = function initSegmentId(initSegment) {
 var SegmentLoader = (function (_videojs$EventTarget) {
   _inherits(SegmentLoader, _videojs$EventTarget);
 
-  function SegmentLoader(options) {
+  function SegmentLoader(settings) {
     var _this = this;
+
+    var options = arguments.length <= 1 || arguments[1] === undefined ? {} : arguments[1];
 
     _classCallCheck(this, SegmentLoader);
 
     _get(Object.getPrototypeOf(SegmentLoader.prototype), 'constructor', this).call(this);
     // check pre-conditions
-    if (!options) {
-      throw new TypeError('Initialization options are required');
+    if (!settings) {
+      throw new TypeError('Initialization settings are required');
     }
-    if (typeof options.currentTime !== 'function') {
+    if (typeof settings.currentTime !== 'function') {
       throw new TypeError('No currentTime getter specified');
     }
-    if (!options.mediaSource) {
+    if (!settings.mediaSource) {
       throw new TypeError('No MediaSource specified');
     }
-    var settings = _videoJs2['default'].mergeOptions(_videoJs2['default'].options.hls, options);
-
     // public properties
     this.state = 'INIT';
     this.bandwidth = settings.bandwidth;
@@ -4090,11 +5223,12 @@ var SegmentLoader = (function (_videojs$EventTarget) {
     this.currentTime_ = settings.currentTime;
     this.seekable_ = settings.seekable;
     this.seeking_ = settings.seeking;
-    this.setCurrentTime_ = settings.setCurrentTime;
+    this.duration_ = settings.duration;
     this.mediaSource_ = settings.mediaSource;
     this.hls_ = settings.hls;
     this.loaderType_ = settings.loaderType;
     this.segmentMetadataTrack_ = settings.segmentMetadataTrack;
+    this.goalBufferLength_ = settings.goalBufferLength;
 
     // private instance variables
     this.checkBufferTimeout_ = null;
@@ -4124,10 +5258,14 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       return _this.trigger('syncinfoupdate');
     });
 
+    this.mediaSource_.addEventListener('sourceopen', function () {
+      return _this.ended_ = false;
+    });
+
     // ...for determining the fetch location
     this.fetchAtBuffer_ = false;
 
-    if (settings.debug) {
+    if (options.debug) {
       this.logger_ = _videoJs2['default'].log.bind(_videoJs2['default'], 'segment-loader', this.loaderType_, '->');
     }
   }
@@ -4157,6 +5295,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
     key: 'dispose',
     value: function dispose() {
       this.state = 'DISPOSED';
+      this.pause();
       this.abort_();
       if (this.sourceUpdater_) {
         this.sourceUpdater_.dispose();
@@ -4180,10 +5319,15 @@ var SegmentLoader = (function (_videojs$EventTarget) {
 
       this.abort_();
 
+      // We aborted the requests we were waiting on, so reset the loader's state to READY
+      // since we are no longer "waiting" on any requests. XHR callback is not always run
+      // when the request is aborted. This will prevent the loader from being stuck in the
+      // WAITING state indefinitely.
+      this.state = 'READY';
+
       // don't wait for buffer check timeouts to begin fetching the
       // next segment
       if (!this.paused()) {
-        this.state = 'READY';
         this.monitorBuffer_();
       }
     }
@@ -4220,6 +5364,78 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       this.pendingSegment_ = null;
       return this.error_;
     }
+  }, {
+    key: 'endOfStream',
+    value: function endOfStream() {
+      this.ended_ = true;
+      this.pause();
+      this.trigger('ended');
+    }
+
+    /**
+     * Indicates which time ranges are buffered
+     *
+     * @return {TimeRange}
+     *         TimeRange object representing the current buffered ranges
+     */
+  }, {
+    key: 'buffered_',
+    value: function buffered_() {
+      if (!this.sourceUpdater_) {
+        return _videoJs2['default'].createTimeRanges();
+      }
+
+      return this.sourceUpdater_.buffered();
+    }
+
+    /**
+     * Gets and sets init segment for the provided map
+     *
+     * @param {Object} map
+     *        The map object representing the init segment to get or set
+     * @param {Boolean=} set
+     *        If true, the init segment for the provided map should be saved
+     * @return {Object}
+     *         map object for desired init segment
+     */
+  }, {
+    key: 'initSegment',
+    value: function initSegment(map) {
+      var set = arguments.length <= 1 || arguments[1] === undefined ? false : arguments[1];
+
+      if (!map) {
+        return null;
+      }
+
+      var id = (0, _binUtils.initSegmentId)(map);
+      var storedMap = this.initSegments_[id];
+
+      if (set && !storedMap && map.bytes) {
+        this.initSegments_[id] = storedMap = {
+          resolvedUri: map.resolvedUri,
+          byterange: map.byterange,
+          bytes: map.bytes
+        };
+      }
+
+      return storedMap || map;
+    }
+
+    /**
+     * Returns true if all configuration required for loading is present, otherwise false.
+     *
+     * @return {Boolean} True if the all configuration is ready for loading
+     * @private
+     */
+  }, {
+    key: 'couldBeginLoading_',
+    value: function couldBeginLoading_() {
+      return this.playlist_ && (
+      // the source updater is created when init_ is called, so either having a
+      // source updater or being in the INIT state with a mimeType is enough
+      // to say we have all the needed configuration to start loading.
+      this.sourceUpdater_ || this.mimeType_ && this.state === 'INIT') && !this.paused();
+    }
 
     /**
      * load a playlist and start to fill the buffer
@@ -4240,13 +5456,13 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       this.syncController_.setDateTimeMapping(this.playlist_);
 
       // if all the configuration is ready, initialize and begin loading
-      if (this.state === 'INIT' && this.mimeType_) {
+      if (this.state === 'INIT' && this.couldBeginLoading_()) {
         return this.init_();
       }
 
       // if we're in the middle of processing a segment already, don't
       // kick off an additional segment request
-      if (!this.sourceUpdater_ || this.state !== 'READY' && this.state !== 'INIT') {
+      if (!this.couldBeginLoading_() || this.state !== 'READY' && this.state !== 'INIT') {
         return;
       }
 
@@ -4305,7 +5521,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
 
       // if we were unpaused but waiting for a playlist, start
       // buffering now
-      if (this.mimeType_ && this.state === 'INIT' && !this.paused()) {
+      if (this.state === 'INIT' && this.couldBeginLoading_()) {
         return this.init_();
       }
 
@@ -4393,7 +5609,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       this.mimeType_ = _mimeType;
       // if we were unpaused but waiting for a sourceUpdater, start
       // buffering now
-      if (this.playlist_ && this.state === 'INIT' && !this.paused()) {
+      if (this.state === 'INIT' && this.couldBeginLoading_()) {
         this.init_();
       }
     }
@@ -4404,6 +5620,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
   }, {
     key: 'resetEverything',
     value: function resetEverything() {
+      this.ended_ = false;
       this.resetLoader();
       this.remove(0, Infinity);
     }
@@ -4430,6 +5647,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
     value: function resyncLoader() {
       this.mediaIndex = null;
       this.syncPoint_ = null;
+      this.abort();
     }
 
     /**
@@ -4498,11 +5716,11 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       }
 
       if (!this.syncPoint_) {
-        this.syncPoint_ = this.syncController_.getSyncPoint(this.playlist_, this.mediaSource_.duration, this.currentTimeline_, this.currentTime_());
+        this.syncPoint_ = this.syncController_.getSyncPoint(this.playlist_, this.duration_(), this.currentTimeline_, this.currentTime_());
       }
 
       // see if we need to begin loading immediately
-      var segmentInfo = this.checkBuffer_(this.sourceUpdater_.buffered(), this.playlist_, this.mediaIndex, this.hasPlayed_(), this.currentTime_(), this.syncPoint_);
+      var segmentInfo = this.checkBuffer_(this.buffered_(), this.playlist_, this.mediaIndex, this.hasPlayed_(), this.currentTime_(), this.syncPoint_);
 
       if (!segmentInfo) {
         return;
@@ -4511,7 +5729,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       var isEndOfStream = detectEndOfStream(this.playlist_, this.mediaSource_, segmentInfo.mediaIndex);
 
       if (isEndOfStream) {
-        this.mediaSource_.endOfStream();
+        this.endOfStream();
         return;
       }
 
@@ -4563,7 +5781,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
 
       // if there is plenty of content buffered, and the video has
       // been played before relax for awhile
-      if (bufferedTime >= _config2['default'].GOAL_BUFFER_LENGTH) {
+      if (bufferedTime >= this.goalBufferLength_()) {
         return null;
       }
 
@@ -4603,13 +5821,13 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       // fetch
       if (this.fetchAtBuffer_) {
         // Find the segment containing the end of the buffer
-        var mediaSourceInfo = (0, _playlist.getMediaInfoForTime_)(playlist, lastBufferedEnd, syncPoint.segmentIndex, syncPoint.time);
+        var mediaSourceInfo = _playlist2['default'].getMediaInfoForTime(playlist, lastBufferedEnd, syncPoint.segmentIndex, syncPoint.time);
 
         mediaIndex = mediaSourceInfo.mediaIndex;
         startOfSegment = mediaSourceInfo.startTime;
       } else {
         // Find the segment containing currentTime
-        var mediaSourceInfo = (0, _playlist.getMediaInfoForTime_)(playlist, currentTime, syncPoint.segmentIndex, syncPoint.time);
+        var mediaSourceInfo = _playlist2['default'].getMediaInfoForTime(playlist, currentTime, syncPoint.segmentIndex, syncPoint.time);
 
         mediaIndex = mediaSourceInfo.mediaIndex;
         startOfSegment = mediaSourceInfo.startTime;
@@ -4690,6 +5908,112 @@ var SegmentLoader = (function (_videojs$EventTarget) {
     }
 
     /**
+     * Determines if the network has enough bandwidth to complete the current segment
+     * request in a timely manner. If not, the request will be aborted early and bandwidth
+     * updated to trigger a playlist switch.
+     *
+     * @param {Object} stats
+     *        Object containing stats about the request timing and size
+     * @return {Boolean} True if the request was aborted, false otherwise
+     * @private
+     */
+  }, {
+    key: 'abortRequestEarly_',
+    value: function abortRequestEarly_(stats) {
+      if (this.hls_.tech_.paused() ||
+      // Don't abort if the current playlist is on the lowestEnabledRendition
+      // TODO: Replace using timeout with a boolean indicating whether this playlist is
+      //       the lowestEnabledRendition.
+      !this.xhrOptions_.timeout ||
+      // Don't abort if we have no bandwidth information to estimate segment sizes
+      !(this.playlist_.attributes && this.playlist_.attributes.BANDWIDTH)) {
+        return false;
+      }
+
+      // Wait at least 1 second since the first byte of data has been received before
+      // using the calculated bandwidth from the progress event to allow the bitrate
+      // to stabilize
+      if (Date.now() - (stats.firstBytesReceivedAt || Date.now()) < 1000) {
+        return false;
+      }
+
+      var currentTime = this.currentTime_();
+      var measuredBandwidth = stats.bandwidth;
+      var segmentDuration = this.pendingSegment_.duration;
+
+      var requestTimeRemaining = _playlist2['default'].estimateSegmentRequestTime(segmentDuration, measuredBandwidth, this.playlist_, stats.bytesReceived);
+
+      // Subtract 1 from the timeUntilRebuffer so we still consider an early abort
+      // if we are only left with less than 1 second when the request completes.
+      // A negative timeUntilRebuffering indicates we are already rebuffering
+      var timeUntilRebuffer = (0, _ranges.timeUntilRebuffer)(this.buffered_(), currentTime, this.hls_.tech_.playbackRate()) - 1;
+
+      // Only consider aborting early if the estimated time to finish the download
+      // is larger than the estimated time until the player runs out of forward buffer
+      if (requestTimeRemaining <= timeUntilRebuffer) {
+        return false;
+      }
+
+      var switchCandidate = (0, _playlistSelectors.minRebufferMaxBandwidthSelector)({
+        master: this.hls_.playlists.master,
+        currentTime: currentTime,
+        bandwidth: measuredBandwidth,
+        duration: this.duration_(),
+        segmentDuration: segmentDuration,
+        timeUntilRebuffer: timeUntilRebuffer,
+        currentTimeline: this.currentTimeline_,
+        syncController: this.syncController_
+      });
+
+      if (!switchCandidate) {
+        return;
+      }
+
+      var rebufferingImpact = requestTimeRemaining - timeUntilRebuffer;
+
+      var timeSavedBySwitching = rebufferingImpact - switchCandidate.rebufferingImpact;
+
+      var minimumTimeSaving = 0.5;
+
+      // If we are already rebuffering, increase the amount of variance we add to the
+      // potential round trip time of the new request so that we are not too aggressive
+      // with switching to a playlist that might save us a fraction of a second.
+      if (timeUntilRebuffer <= _ranges.TIME_FUDGE_FACTOR) {
+        minimumTimeSaving = 1;
+      }
+
+      if (!switchCandidate.playlist || switchCandidate.playlist.uri === this.playlist_.uri || timeSavedBySwitching < minimumTimeSaving) {
+        return false;
+      }
+
+      // set the bandwidth to that of the desired playlist being sure to scale by
+      // BANDWIDTH_VARIANCE and add one so the playlist selector does not exclude it
+      this.bandwidth = switchCandidate.playlist.attributes.BANDWIDTH * _config2['default'].BANDWIDTH_VARIANCE + 1;
+      this.abort();
+      this.trigger('bandwidthupdate');
+      return true;
+    }
+
+    /**
+     * XHR `progress` event handler
+     *
+     * @param {Event}
+     *        The XHR `progress` event
+     * @param {Object} simpleSegment
+     *        A simplified segment object copy
+     * @private
+     */
+  }, {
+    key: 'handleProgress_',
+    value: function handleProgress_(event, simpleSegment) {
+      if (!this.pendingSegment_ || simpleSegment.requestId !== this.pendingSegment_.requestId || this.abortRequestEarly_(simpleSegment.stats)) {
+        return;
+      }
+
+      this.trigger('progress');
+    }
+
+    /**
      * load a specific segment from a request into the buffer
      *
      * @private
@@ -4697,21 +6021,13 @@ var SegmentLoader = (function (_videojs$EventTarget) {
   }, {
     key: 'loadSegment_',
     value: function loadSegment_(segmentInfo) {
-      var _this3 = this;
-
       this.state = 'WAITING';
       this.pendingSegment_ = segmentInfo;
       this.trimBackBuffer_(segmentInfo);
 
       segmentInfo.abortRequests = (0, _mediaSegmentRequest.mediaSegmentRequest)(this.hls_.xhr, this.xhrOptions_, this.decrypter_, this.createSimplifiedSegmentObj_(segmentInfo),
       // progress callback
-      function (event, segment) {
-        if (!_this3.pendingSegment_ || segment.requestId !== _this3.pendingSegment_.requestId) {
-          return;
-        }
-        // TODO: Use progress-based bandwidth to early abort low-bandwidth situations
-        _this3.trigger('progress');
-      }, this.segmentRequestFinished_.bind(this));
+      this.handleProgress_.bind(this), this.segmentRequestFinished_.bind(this));
     }
 
     /**
@@ -4729,18 +6045,18 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       var currentTime = this.currentTime_();
       var removeToTime = 0;
 
-      // Chrome has a hard limit of 150mb of
+      // Chrome has a hard limit of 150MB of
       // buffer and a very conservative "garbage collector"
       // We manually clear out the old buffer to ensure
       // we don't trigger the QuotaExceeded error
       // on the source buffer during subsequent appends
 
       // If we have a seekable range use that as the limit for what can be removed safely
-      // otherwise remove anything older than 1 minute before the current play head
+      // otherwise remove anything older than 30 seconds before the current play head
       if (seekable.length && seekable.start(0) > 0 && seekable.start(0) < currentTime) {
         removeToTime = seekable.start(0);
       } else {
-        removeToTime = currentTime - 60;
+        removeToTime = currentTime - 30;
       }
 
       if (removeToTime > 0) {
@@ -4779,16 +6095,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       }
 
       if (segment.map) {
-        var map = this.initSegments_[initSegmentId(segment.map)];
-
-        if (map) {
-          simpleSegment.map = map;
-        } else {
-          simpleSegment.map = {
-            resolvedUri: segment.map.resolvedUri,
-            byterange: segment.map.byterange
-          };
-        }
+        simpleSegment.map = this.initSegment(segment.map);
       }
 
       return simpleSegment;
@@ -4829,6 +6136,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       // an error occurred from the active pendingSegment_ so reset everything
       if (error) {
         this.pendingSegment_ = null;
+        this.state = 'READY';
 
         // the requests were aborted just record the aborted stat and exit
         // this is not a true error condition and nothing corrective needs
@@ -4838,7 +6146,6 @@ var SegmentLoader = (function (_videojs$EventTarget) {
           return;
         }
 
-        this.state = 'READY';
         this.pause();
 
         // the error is really just that at least one of the requests timed-out
@@ -4868,7 +6175,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       // if this request included an initialization segment, save that data
       // to the initSegment cache
       if (simpleSegment.map) {
-        this.initSegments_[initSegmentId(simpleSegment.map)] = simpleSegment.map;
+        simpleSegment.map = this.initSegment(simpleSegment.map, true);
       }
 
       this.processSegmentResponse_(simpleSegment);
@@ -4902,7 +6209,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
   }, {
     key: 'handleSegment_',
     value: function handleSegment_() {
-      var _this4 = this;
+      var _this3 = this;
 
       if (!this.pendingSegment_) {
         this.state = 'READY';
@@ -4925,19 +6232,21 @@ var SegmentLoader = (function (_videojs$EventTarget) {
 
       if (segmentInfo.timestampOffset !== null && segmentInfo.timestampOffset !== this.sourceUpdater_.timestampOffset()) {
         this.sourceUpdater_.timestampOffset(segmentInfo.timestampOffset);
+        // fired when a timestamp offset is set in HLS (can also identify discontinuities)
+        this.trigger('timestampoffset');
       }
 
       // if the media initialization segment is changing, append it
       // before the content segment
       if (segment.map) {
         (function () {
-          var initId = initSegmentId(segment.map);
+          var initId = (0, _binUtils.initSegmentId)(segment.map);
 
-          if (!_this4.activeInitSegmentId_ || _this4.activeInitSegmentId_ !== initId) {
-            var initSegment = _this4.initSegments_[initId];
+          if (!_this3.activeInitSegmentId_ || _this3.activeInitSegmentId_ !== initId) {
+            var initSegment = _this3.initSegment(segment.map);
 
-            _this4.sourceUpdater_.appendBuffer(initSegment.bytes, function () {
-              _this4.activeInitSegmentId_ = initId;
+            _this3.sourceUpdater_.appendBuffer(initSegment.bytes, function () {
+              _this3.activeInitSegmentId_ = initId;
             });
           }
         })();
@@ -5012,10 +6321,10 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       // any time an update finishes and the last segment is in the
       // buffer, end the stream. this ensures the "ended" event will
       // fire if playback reaches that point.
-      var isEndOfStream = detectEndOfStream(segmentInfo.playlist, this.mediaSource_, this.mediaIndex + 1);
+      var isEndOfStream = detectEndOfStream(segmentInfo.playlist, this.mediaSource_, segmentInfo.mediaIndex + 1);
 
       if (isEndOfStream) {
-        this.mediaSource_.endOfStream();
+        this.endOfStream();
       }
 
       if (!this.paused()) {
@@ -5077,6 +6386,11 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       var start = segment.start;
       var end = segment.end;
 
+      // Do not try adding the cue if the start and end times are invalid.
+      if (!finite(start) || !finite(end)) {
+        return;
+      }
+
       (0, _videojsContribMediaSourcesEs5RemoveCuesFromTrackJs2['default'])(start, end, this.segmentMetadataTrack_);
 
       var Cue = _globalWindow2['default'].WebKitDataCue || _globalWindow2['default'].VTTCue;
@@ -5104,7 +6418,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
 exports['default'] = SegmentLoader;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./config":3,"./media-segment-request":6,"./playlist":9,"./source-updater":15,"global/window":29,"videojs-contrib-media-sources/es5/remove-cues-from-track.js":70}],15:[function(require,module,exports){
+},{"./bin-utils":2,"./config":3,"./media-segment-request":6,"./playlist":10,"./playlist-selectors":9,"./ranges":11,"./source-updater":16,"global/window":30,"videojs-contrib-media-sources/es5/remove-cues-from-track.js":71}],16:[function(require,module,exports){
 (function (global){
 /**
  * @file source-updater.js
@@ -5124,6 +6438,8 @@ function _classCallCheck(instance, Constructor) { if (!(instance instanceof Cons
 var _videoJs = (typeof window !== "undefined" ? window['videojs'] : typeof global !== "undefined" ? global['videojs'] : null);
 
 var _videoJs2 = _interopRequireDefault(_videoJs);
+
+var noop = function noop() {};
 
 /**
  * A queue of callbacks to be serialized and applied when a
@@ -5170,6 +6486,7 @@ var SourceUpdater = (function () {
     this.pendingCallback_ = null;
     this.timestampOffset_ = 0;
     this.mediaSource = mediaSource;
+    this.processedAppend_ = false;
 
     if (mediaSource.readyState === 'closed') {
       mediaSource.addEventListener('sourceopen', createSourceBuffer);
@@ -5190,9 +6507,11 @@ var SourceUpdater = (function () {
     value: function abort(done) {
       var _this2 = this;
 
-      this.queueCallback_(function () {
-        _this2.sourceBuffer_.abort();
-      }, done);
+      if (this.processedAppend_) {
+        this.queueCallback_(function () {
+          _this2.sourceBuffer_.abort();
+        }, done);
+      }
     }
 
     /**
@@ -5206,6 +6525,8 @@ var SourceUpdater = (function () {
     key: 'appendBuffer',
     value: function appendBuffer(bytes, done) {
       var _this3 = this;
+
+      this.processedAppend_ = true;
 
       this.queueCallback_(function () {
         _this3.sourceBuffer_.appendBuffer(bytes);
@@ -5227,22 +6548,6 @@ var SourceUpdater = (function () {
     }
 
     /**
-     * Queue an update to set the duration.
-     *
-     * @param {Double} duration what to set the duration to
-     * @see http://www.w3.org/TR/media-source/#widl-MediaSource-duration
-     */
-  }, {
-    key: 'duration',
-    value: function duration(_duration) {
-      var _this4 = this;
-
-      this.queueCallback_(function () {
-        _this4.sourceBuffer_.duration = _duration;
-      });
-    }
-
-    /**
      * Queue an update to remove a time range from the buffer.
      *
      * @param {Number} start where to start the removal
@@ -5252,15 +6557,17 @@ var SourceUpdater = (function () {
   }, {
     key: 'remove',
     value: function remove(start, end) {
-      var _this5 = this;
+      var _this4 = this;
 
-      this.queueCallback_(function () {
-        _this5.sourceBuffer_.remove(start, end);
-      });
+      if (this.processedAppend_) {
+        this.queueCallback_(function () {
+          _this4.sourceBuffer_.remove(start, end);
+        }, noop);
+      }
     }
 
     /**
-     * wether the underlying sourceBuffer is updating or not
+     * Whether the underlying sourceBuffer is updating or not
      *
      * @return {Boolean} the updating status of the SourceBuffer
      */
@@ -5278,11 +6585,11 @@ var SourceUpdater = (function () {
   }, {
     key: 'timestampOffset',
     value: function timestampOffset(offset) {
-      var _this6 = this;
+      var _this5 = this;
 
       if (typeof offset !== 'undefined') {
         this.queueCallback_(function () {
-          _this6.sourceBuffer_.timestampOffset = offset;
+          _this5.sourceBuffer_.timestampOffset = offset;
         });
         this.timestampOffset_ = offset;
       }
@@ -5290,7 +6597,7 @@ var SourceUpdater = (function () {
     }
 
     /**
-     * que a callback to run
+     * Queue a callback to run
      */
   }, {
     key: 'queueCallback_',
@@ -5300,7 +6607,7 @@ var SourceUpdater = (function () {
     }
 
     /**
-     * run a queued callback
+     * Run a queued callback
      */
   }, {
     key: 'runCallback_',
@@ -5333,137 +6640,6 @@ var SourceUpdater = (function () {
 exports['default'] = SourceUpdater;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],16:[function(require,module,exports){
-/**
- * @file stream.js
- */
-/**
- * A lightweight readable stream implemention that handles event dispatching.
- *
- * @class Stream
- */
-'use strict';
-
-Object.defineProperty(exports, '__esModule', {
-  value: true
-});
-
-var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ('value' in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
-
-function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError('Cannot call a class as a function'); } }
-
-var Stream = (function () {
-  function Stream() {
-    _classCallCheck(this, Stream);
-
-    this.listeners = {};
-  }
-
-  /**
-   * Add a listener for a specified event type.
-   *
-   * @param {String} type the event name
-   * @param {Function} listener the callback to be invoked when an event of
-   * the specified type occurs
-   */
-
-  _createClass(Stream, [{
-    key: 'on',
-    value: function on(type, listener) {
-      if (!this.listeners[type]) {
-        this.listeners[type] = [];
-      }
-      this.listeners[type].push(listener);
-    }
-
-    /**
-     * Remove a listener for a specified event type.
-     *
-     * @param {String} type the event name
-     * @param {Function} listener  a function previously registered for this
-     * type of event through `on`
-     * @return {Boolean} if we could turn it off or not
-     */
-  }, {
-    key: 'off',
-    value: function off(type, listener) {
-      var index = undefined;
-
-      if (!this.listeners[type]) {
-        return false;
-      }
-      index = this.listeners[type].indexOf(listener);
-      this.listeners[type].splice(index, 1);
-      return index > -1;
-    }
-
-    /**
-     * Trigger an event of the specified type on this stream. Any additional
-     * arguments to this function are passed as parameters to event listeners.
-     *
-     * @param {String} type the event name
-     */
-  }, {
-    key: 'trigger',
-    value: function trigger(type) {
-      var callbacks = undefined;
-      var i = undefined;
-      var length = undefined;
-      var args = undefined;
-
-      callbacks = this.listeners[type];
-      if (!callbacks) {
-        return;
-      }
-      // Slicing the arguments on every invocation of this method
-      // can add a significant amount of overhead. Avoid the
-      // intermediate object creation for the common case of a
-      // single callback argument
-      if (arguments.length === 2) {
-        length = callbacks.length;
-        for (i = 0; i < length; ++i) {
-          callbacks[i].call(this, arguments[1]);
-        }
-      } else {
-        args = Array.prototype.slice.call(arguments, 1);
-        length = callbacks.length;
-        for (i = 0; i < length; ++i) {
-          callbacks[i].apply(this, args);
-        }
-      }
-    }
-
-    /**
-     * Destroys the stream and cleans up.
-     */
-  }, {
-    key: 'dispose',
-    value: function dispose() {
-      this.listeners = {};
-    }
-
-    /**
-     * Forwards all `data` events on this stream to the destination stream. The
-     * destination stream should provide a method `push` to receive the data
-     * events as they arrive.
-     *
-     * @param {Stream} destination the stream that will receive all `data` events
-     * @see http://nodejs.org/api/stream.html#stream_readable_pipe_destination_options
-     */
-  }, {
-    key: 'pipe',
-    value: function pipe(destination) {
-      this.on('data', function (data) {
-        destination.push(data);
-      });
-    }
-  }]);
-
-  return Stream;
-})();
-
-exports['default'] = Stream;
-module.exports = exports['default'];
 },{}],17:[function(require,module,exports){
 (function (global){
 /**
@@ -5478,7 +6654,7 @@ Object.defineProperty(exports, '__esModule', {
 
 var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ('value' in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
 
-var _get = function get(_x, _x2, _x3) { var _again = true; _function: while (_again) { var object = _x, property = _x2, receiver = _x3; _again = false; if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { _x = parent; _x2 = property; _x3 = receiver; _again = true; desc = parent = undefined; continue _function; } } else if ('value' in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } } };
+var _get = function get(_x2, _x3, _x4) { var _again = true; _function: while (_again) { var object = _x2, property = _x3, receiver = _x4; _again = false; if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { _x2 = parent; _x3 = property; _x4 = receiver; _again = true; desc = parent = undefined; continue _function; } } else if ('value' in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } } };
 
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
 
@@ -5537,7 +6713,7 @@ var syncPointStrategies = [
 {
   name: 'Segment',
   run: function run(syncController, playlist, duration, currentTimeline, currentTime) {
-    var segments = playlist.segments;
+    var segments = playlist.segments || [];
     var syncPoint = null;
     var lastDistance = null;
 
@@ -5576,7 +6752,7 @@ var syncPointStrategies = [
 
     currentTime = currentTime || 0;
 
-    if (playlist.discontinuityStarts.length) {
+    if (playlist.discontinuityStarts && playlist.discontinuityStarts.length) {
       var lastDistance = null;
 
       for (var i = 0; i < playlist.discontinuityStarts.length; i++) {
@@ -5629,6 +6805,8 @@ var SyncController = (function (_videojs$EventTarget) {
   _inherits(SyncController, _videojs$EventTarget);
 
   function SyncController() {
+    var options = arguments.length <= 0 || arguments[0] === undefined ? {} : arguments[0];
+
     _classCallCheck(this, SyncController);
 
     _get(Object.getPrototypeOf(SyncController.prototype), 'constructor', this).call(this);
@@ -5641,7 +6819,7 @@ var SyncController = (function (_videojs$EventTarget) {
     this.discontinuities = [];
     this.datetimeToDisplayTime = null;
 
-    if (_videoJs2['default'].options.hls && _videoJs2['default'].options.hls.debug) {
+    if (options.debug) {
       this.logger_ = _videoJs2['default'].log.bind(_videoJs2['default'], 'sync-controller ->');
     }
   }
@@ -5652,15 +6830,90 @@ var SyncController = (function (_videojs$EventTarget) {
    * A sync-point is defined as a known mapping from display-time to
    * a segment-index in the current playlist.
    *
-   * @param {Playlist} media - The playlist that needs a sync-point
-   * @param {Number} duration - Duration of the MediaSource (Infinite if playing a live source)
-   * @param {Number} currentTimeline - The last timeline from which a segment was loaded
-   * @returns {Object} - A sync-point object
+   * @param {Playlist} playlist
+   *        The playlist that needs a sync-point
+   * @param {Number} duration
+   *        Duration of the MediaSource (Infinite if playing a live source)
+   * @param {Number} currentTimeline
+   *        The last timeline from which a segment was loaded
+   * @returns {Object}
+   *          A sync-point object
    */
 
   _createClass(SyncController, [{
     key: 'getSyncPoint',
     value: function getSyncPoint(playlist, duration, currentTimeline, currentTime) {
+      var syncPoints = this.runStrategies_(playlist, duration, currentTimeline, currentTime);
+
+      if (!syncPoints.length) {
+        // Signal that we need to attempt to get a sync-point manually
+        // by fetching a segment in the playlist and constructing
+        // a sync-point from that information
+        return null;
+      }
+
+      // Now find the sync-point that is closest to the currentTime because
+      // that should result in the most accurate guess about which segment
+      // to fetch
+      return this.selectSyncPoint_(syncPoints, { key: 'time', value: currentTime });
+    }
+
+    /**
+     * Calculate the amount of time that has expired off the playlist during playback
+     *
+     * @param {Playlist} playlist
+     *        Playlist object to calculate expired from
+     * @param {Number} duration
+     *        Duration of the MediaSource (Infinity if playling a live source)
+     * @returns {Number|null}
+     *          The amount of time that has expired off the playlist during playback. Null
+     *          if no sync-points for the playlist can be found.
+     */
+  }, {
+    key: 'getExpiredTime',
+    value: function getExpiredTime(playlist, duration) {
+      if (!playlist || !playlist.segments) {
+        return null;
+      }
+
+      var syncPoints = this.runStrategies_(playlist, duration, playlist.discontinuitySequence, 0);
+
+      // Without sync-points, there is not enough information to determine the expired time
+      if (!syncPoints.length) {
+        return null;
+      }
+
+      var syncPoint = this.selectSyncPoint_(syncPoints, {
+        key: 'segmentIndex',
+        value: 0
+      });
+
+      // If the sync-point is beyond the start of the playlist, we want to subtract the
+      // duration from index 0 to syncPoint.segmentIndex instead of adding.
+      if (syncPoint.segmentIndex > 0) {
+        syncPoint.time *= -1;
+      }
+
+      return Math.abs(syncPoint.time + (0, _playlist.sumDurations)(playlist, syncPoint.segmentIndex, 0));
+    }
+
+    /**
+     * Runs each sync-point strategy and returns a list of sync-points returned by the
+     * strategies
+     *
+     * @private
+     * @param {Playlist} playlist
+     *        The playlist that needs a sync-point
+     * @param {Number} duration
+     *        Duration of the MediaSource (Infinity if playing a live source)
+     * @param {Number} currentTimeline
+     *        The last timeline from which a segment was loaded
+     * @returns {Array}
+     *          A list of sync-point objects
+     */
+  }, {
+    key: 'runStrategies_',
+    value: function runStrategies_(playlist, duration, currentTimeline, currentTime) {
       var syncPoints = [];
 
       // Try to find a sync-point in by utilizing various strategies...
@@ -5678,22 +6931,33 @@ var SyncController = (function (_videojs$EventTarget) {
         }
       }
 
-      if (!syncPoints.length) {
-        // Signal that we need to attempt to get a sync-point manually
-        // by fetching a segment in the playlist and constructing
-        // a sync-point from that information
-        return null;
-      }
+      return syncPoints;
+    }
 
-      // Now find the sync-point that is closest to the currentTime because
-      // that should result in the most accurate guess about which segment
-      // to fetch
+    /**
+     * Selects the sync-point nearest the specified target
+     *
+     * @private
+     * @param {Array} syncPoints
+     *        List of sync-points to select from
+     * @param {Object} target
+     *        Object specifying the property and value we are targeting
+     * @param {String} target.key
+     *        Specifies the property to target. Must be either 'time' or 'segmentIndex'
+     * @param {Number} target.value
+     *        The value to target for the specified key.
+     * @returns {Object}
+     *          The sync-point nearest the target
+     */
+  }, {
+    key: 'selectSyncPoint_',
+    value: function selectSyncPoint_(syncPoints, target) {
       var bestSyncPoint = syncPoints[0].syncPoint;
-      var bestDistance = Math.abs(syncPoints[0].syncPoint.time - currentTime);
+      var bestDistance = Math.abs(syncPoints[0].syncPoint[target.key] - target.value);
       var bestStrategy = syncPoints[0].strategy;
 
       for (var i = 1; i < syncPoints.length; i++) {
-        var newDistance = Math.abs(syncPoints[i].syncPoint.time - currentTime);
+        var newDistance = Math.abs(syncPoints[i].syncPoint[target.key] - target.value);
 
         if (newDistance < bestDistance) {
           bestDistance = newDistance;
@@ -5701,6 +6965,7 @@ var SyncController = (function (_videojs$EventTarget) {
           bestStrategy = syncPoints[i].strategy;
         }
       }
+
       this.logger_('syncPoint with strategy <' + bestStrategy + '> chosen: ', bestSyncPoint);
       return bestSyncPoint;
     }
@@ -5723,7 +6988,7 @@ var SyncController = (function (_videojs$EventTarget) {
       for (var i = mediaSequenceDiff - 1; i >= 0; i--) {
         var lastRemovedSegment = oldPlaylist.segments[i];
 
-        if (typeof lastRemovedSegment.start !== 'undefined') {
+        if (lastRemovedSegment && typeof lastRemovedSegment.start !== 'undefined') {
           newPlaylist.syncInfo = {
             mediaSequence: oldPlaylist.mediaSequence + i,
             time: lastRemovedSegment.start
@@ -5847,14 +7112,26 @@ var SyncController = (function (_videojs$EventTarget) {
         end: segmentEndTime
       };
     }
+  }, {
+    key: 'timestampOffsetForTimeline',
+    value: function timestampOffsetForTimeline(timeline) {
+      if (typeof this.timelines[timeline] === 'undefined') {
+        return null;
+      }
+      return this.timelines[timeline].time;
+    }
 
     /**
      * Use the "media time" for a segment to generate a mapping to "display time" and
      * save that display time to the segment.
      *
      * @private
-     * @param {SegmentInfo} segmentInfo - The current active request information
-     * @param {object} timingInfo - The start and end time of the current segment in "media time"
+     * @param {SegmentInfo} segmentInfo
+     *        The current active request information
+     * @param {object} timingInfo
+     *        The start and end time of the current segment in "media time"
+     * @returns {Boolean}
+     *          Returns false if segment time mapping could not be calculated
      */
   }, {
     key: 'calculateSegmentTimeMapping_',
@@ -5866,12 +7143,13 @@ var SyncController = (function (_videojs$EventTarget) {
         this.logger_('tsO:', segmentInfo.timestampOffset);
 
         mappingObj = {
-          time: segmentInfo.timestampOffset,
-          mapping: segmentInfo.timestampOffset - timingInfo.start
+          time: segmentInfo.startOfSegment,
+          mapping: segmentInfo.startOfSegment - timingInfo.start
         };
         this.timelines[segmentInfo.timeline] = mappingObj;
+        this.trigger('timestampoffset');
 
-        segment.start = segmentInfo.timestampOffset;
+        segment.start = segmentInfo.startOfSegment;
         segment.end = timingInfo.end + mappingObj.mapping;
       } else if (mappingObj) {
         segment.start = timingInfo.start + mappingObj.mapping;
@@ -5915,17 +7193,18 @@ var SyncController = (function (_videojs$EventTarget) {
           var accuracy = Math.abs(mediaIndexDiff);
 
           if (!this.discontinuities[discontinuity] || this.discontinuities[discontinuity].accuracy > accuracy) {
+            var time = undefined;
+
             if (mediaIndexDiff < 0) {
-              this.discontinuities[discontinuity] = {
-                time: segment.start - (0, _playlist.sumDurations)(playlist, segmentInfo.mediaIndex, segmentIndex),
-                accuracy: accuracy
-              };
+              time = segment.start - (0, _playlist.sumDurations)(playlist, segmentInfo.mediaIndex, segmentIndex);
             } else {
-              this.discontinuities[discontinuity] = {
-                time: segment.end + (0, _playlist.sumDurations)(playlist, segmentInfo.mediaIndex + 1, segmentIndex),
-                accuracy: accuracy
-              };
+              time = segment.end + (0, _playlist.sumDurations)(playlist, segmentInfo.mediaIndex + 1, segmentIndex);
             }
+
+            this.discontinuities[discontinuity] = {
+              time: time,
+              accuracy: accuracy
+            };
           }
         }
       }
@@ -5947,7 +7226,458 @@ var SyncController = (function (_videojs$EventTarget) {
 
 exports['default'] = SyncController;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./playlist":9,"mux.js/lib/mp4/probe":54,"mux.js/lib/tools/ts-inspector.js":56}],18:[function(require,module,exports){
+},{"./playlist":10,"mux.js/lib/mp4/probe":55,"mux.js/lib/tools/ts-inspector.js":57}],18:[function(require,module,exports){
+(function (global){
+/**
+ * @file vtt-segment-loader.js
+ */
+'use strict';
+
+Object.defineProperty(exports, '__esModule', {
+  value: true
+});
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ('value' in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+var _get = function get(_x3, _x4, _x5) { var _again = true; _function: while (_again) { var object = _x3, property = _x4, receiver = _x5; _again = false; if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { _x3 = parent; _x4 = property; _x5 = receiver; _again = true; desc = parent = undefined; continue _function; } } else if ('value' in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } } };
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError('Cannot call a class as a function'); } }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== 'function' && superClass !== null) { throw new TypeError('Super expression must either be null or a function, not ' + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
+var _segmentLoader = require('./segment-loader');
+
+var _segmentLoader2 = _interopRequireDefault(_segmentLoader);
+
+var _videoJs = (typeof window !== "undefined" ? window['videojs'] : typeof global !== "undefined" ? global['videojs'] : null);
+
+var _videoJs2 = _interopRequireDefault(_videoJs);
+
+var _globalWindow = require('global/window');
+
+var _globalWindow2 = _interopRequireDefault(_globalWindow);
+
+var _videojsContribMediaSourcesEs5RemoveCuesFromTrackJs = require('videojs-contrib-media-sources/es5/remove-cues-from-track.js');
+
+var _videojsContribMediaSourcesEs5RemoveCuesFromTrackJs2 = _interopRequireDefault(_videojsContribMediaSourcesEs5RemoveCuesFromTrackJs);
+
+var _binUtils = require('./bin-utils');
+
+var VTT_LINE_TERMINATORS = new Uint8Array('\n\n'.split('').map(function (char) {
+  return char.charCodeAt(0);
+}));
+
+var uintToString = function uintToString(uintArray) {
+  return String.fromCharCode.apply(null, uintArray);
+};
+
+/**
+ * An object that manages segment loading and appending.
+ *
+ * @class VTTSegmentLoader
+ * @param {Object} options required and optional options
+ * @extends videojs.EventTarget
+ */
+
+var VTTSegmentLoader = (function (_SegmentLoader) {
+  _inherits(VTTSegmentLoader, _SegmentLoader);
+
+  function VTTSegmentLoader(settings) {
+    var options = arguments.length <= 1 || arguments[1] === undefined ? {} : arguments[1];
+
+    _classCallCheck(this, VTTSegmentLoader);
+
+    _get(Object.getPrototypeOf(VTTSegmentLoader.prototype), 'constructor', this).call(this, settings, options);
+
+    // SegmentLoader requires a MediaSource be specified or it will throw an error;
+    // however, VTTSegmentLoader has no need of a media source, so delete the reference
+    this.mediaSource_ = null;
+
+    this.subtitlesTrack_ = null;
+  }
+
+  /**
+   * Indicates which time ranges are buffered
+   *
+   * @return {TimeRange}
+   *         TimeRange object representing the current buffered ranges
+   */
+
+  _createClass(VTTSegmentLoader, [{
+    key: 'buffered_',
+    value: function buffered_() {
+      if (!this.subtitlesTrack_ || !this.subtitlesTrack_.cues.length) {
+        return _videoJs2['default'].createTimeRanges();
+      }
+
+      var cues = this.subtitlesTrack_.cues;
+      var start = cues[0].startTime;
+      var end = cues[cues.length - 1].startTime;
+
+      return _videoJs2['default'].createTimeRanges([[start, end]]);
+    }
+
+    /**
+     * Gets and sets init segment for the provided map
+     *
+     * @param {Object} map
+     *        The map object representing the init segment to get or set
+     * @param {Boolean=} set
+     *        If true, the init segment for the provided map should be saved
+     * @return {Object}
+     *         map object for desired init segment
+     */
+  }, {
+    key: 'initSegment',
+    value: function initSegment(map) {
+      var set = arguments.length <= 1 || arguments[1] === undefined ? false : arguments[1];
+
+      if (!map) {
+        return null;
+      }
+
+      var id = (0, _binUtils.initSegmentId)(map);
+      var storedMap = this.initSegments_[id];
+
+      if (set && !storedMap && map.bytes) {
+        // append WebVTT line terminators to the media initialization segment if it exists
+        // to follow the WebVTT spec (https://w3c.github.io/webvtt/#file-structure) that
+        // requires two or more WebVTT line terminators between the WebVTT header and the
+        // rest of the file
+        var combinedByteLength = VTT_LINE_TERMINATORS.byteLength + map.bytes.byteLength;
+        var combinedSegment = new Uint8Array(combinedByteLength);
+
+        combinedSegment.set(map.bytes);
+        combinedSegment.set(VTT_LINE_TERMINATORS, map.bytes.byteLength);
+
+        this.initSegments_[id] = storedMap = {
+          resolvedUri: map.resolvedUri,
+          byterange: map.byterange,
+          bytes: combinedSegment
+        };
+      }
+
+      return storedMap || map;
+    }
+
+    /**
+     * Returns true if all configuration required for loading is present, otherwise false.
+     *
+     * @return {Boolean} True if the all configuration is ready for loading
+     * @private
+     */
+  }, {
+    key: 'couldBeginLoading_',
+    value: function couldBeginLoading_() {
+      return this.playlist_ && this.subtitlesTrack_ && !this.paused();
+    }
+
+    /**
+     * Once all the starting parameters have been specified, begin
+     * operation. This method should only be invoked from the INIT
+     * state.
+     *
+     * @private
+     */
+  }, {
+    key: 'init_',
+    value: function init_() {
+      this.state = 'READY';
+      this.resetEverything();
+      return this.monitorBuffer_();
+    }
+
+    /**
+     * Set a subtitle track on the segment loader to add subtitles to
+     *
+     * @param {TextTrack} track
+     *        The text track to add loaded subtitles to
+     */
+  }, {
+    key: 'track',
+    value: function track(_track) {
+      this.subtitlesTrack_ = _track;
+
+      // if we were unpaused but waiting for a sourceUpdater, start
+      // buffering now
+      if (this.state === 'INIT' && this.couldBeginLoading_()) {
+        this.init_();
+      }
+    }
+
+    /**
+     * Remove any data in the source buffer between start and end times
+     * @param {Number} start - the start time of the region to remove from the buffer
+     * @param {Number} end - the end time of the region to remove from the buffer
+     */
+  }, {
+    key: 'remove',
+    value: function remove(start, end) {
+      (0, _videojsContribMediaSourcesEs5RemoveCuesFromTrackJs2['default'])(start, end, this.subtitlesTrack_);
+    }
+
+    /**
+     * fill the buffer with segements unless the sourceBuffers are
+     * currently updating
+     *
+     * Note: this function should only ever be called by monitorBuffer_
+     * and never directly
+     *
+     * @private
+     */
+  }, {
+    key: 'fillBuffer_',
+    value: function fillBuffer_() {
+      var _this = this;
+
+      if (!this.syncPoint_) {
+        this.syncPoint_ = this.syncController_.getSyncPoint(this.playlist_, this.duration_(), this.currentTimeline_, this.currentTime_());
+      }
+
+      // see if we need to begin loading immediately
+      var segmentInfo = this.checkBuffer_(this.buffered_(), this.playlist_, this.mediaIndex, this.hasPlayed_(), this.currentTime_(), this.syncPoint_);
+
+      segmentInfo = this.skipEmptySegments_(segmentInfo);
+
+      if (!segmentInfo) {
+        return;
+      }
+
+      if (this.syncController_.timestampOffsetForTimeline(segmentInfo.timeline) === null) {
+        // We don't have the timestamp offset that we need to sync subtitles.
+        // Rerun on a timestamp offset or user interaction.
+        var checkTimestampOffset = function checkTimestampOffset() {
+          _this.state = 'READY';
+          if (!_this.paused()) {
+            // if not paused, queue a buffer check as soon as possible
+            _this.monitorBuffer_();
+          }
+        };
+
+        this.syncController_.one('timestampoffset', checkTimestampOffset);
+        this.state = 'WAITING_ON_TIMELINE';
+        return;
+      }
+
+      this.loadSegment_(segmentInfo);
+    }
+
+    /**
+     * Prevents the segment loader from requesting segments we know contain no subtitles
+     * by walking forward until we find the next segment that we don't know whether it is
+     * empty or not.
+     *
+     * @param {Object} segmentInfo
+     *        a segment info object that describes the current segment
+     * @return {Object}
+     *         a segment info object that describes the current segment
+     */
+  }, {
+    key: 'skipEmptySegments_',
+    value: function skipEmptySegments_(segmentInfo) {
+      while (segmentInfo && segmentInfo.segment.empty) {
+        segmentInfo = this.generateSegmentInfo_(segmentInfo.playlist, segmentInfo.mediaIndex + 1, segmentInfo.startOfSegment + segmentInfo.duration, segmentInfo.isSyncRequest);
+      }
+      return segmentInfo;
+    }
+
+    /**
+     * append a decrypted segement to the SourceBuffer through a SourceUpdater
+     *
+     * @private
+     */
+  }, {
+    key: 'handleSegment_',
+    value: function handleSegment_() {
+      var _this2 = this;
+
+      if (!this.pendingSegment_) {
+        this.state = 'READY';
+        return;
+      }
+
+      this.state = 'APPENDING';
+
+      var segmentInfo = this.pendingSegment_;
+      var segment = segmentInfo.segment;
+
+      // Make sure that vttjs has loaded, otherwise, wait till it finished loading
+      if (typeof _globalWindow2['default'].WebVTT !== 'function' && this.subtitlesTrack_ && this.subtitlesTrack_.tech_) {
+        var _ret = (function () {
+
+          var loadHandler = function loadHandler() {
+            _this2.handleSegment_();
+          };
+
+          _this2.state = 'WAITING_ON_VTTJS';
+          _this2.subtitlesTrack_.tech_.one('vttjsloaded', loadHandler);
+          _this2.subtitlesTrack_.tech_.one('vttjserror', function () {
+            _this2.subtitlesTrack_.tech_.off('vttjsloaded', loadHandler);
+            _this2.error({
+              message: 'Error loading vtt.js'
+            });
+            _this2.state = 'READY';
+            _this2.pause();
+            _this2.trigger('error');
+          });
+
+          return {
+            v: undefined
+          };
+        })();
+
+        if (typeof _ret === 'object') return _ret.v;
+      }
+
+      segment.requested = true;
+
+      try {
+        this.parseVTTCues_(segmentInfo);
+      } catch (e) {
+        this.error({
+          message: e.message
+        });
+        this.state = 'READY';
+        this.pause();
+        return this.trigger('error');
+      }
+
+      this.updateTimeMapping_(segmentInfo, this.syncController_.timelines[segmentInfo.timeline], this.playlist_);
+
+      if (segmentInfo.isSyncRequest) {
+        this.trigger('syncinfoupdate');
+        this.pendingSegment_ = null;
+        this.state = 'READY';
+        return;
+      }
+
+      segmentInfo.byteLength = segmentInfo.bytes.byteLength;
+
+      this.mediaSecondsLoaded += segment.duration;
+
+      segmentInfo.cues.forEach(function (cue) {
+        _this2.subtitlesTrack_.addCue(cue);
+      });
+
+      this.handleUpdateEnd_();
+    }
+
+    /**
+     * Uses the WebVTT parser to parse the segment response
+     *
+     * @param {Object} segmentInfo
+     *        a segment info object that describes the current segment
+     * @private
+     */
+  }, {
+    key: 'parseVTTCues_',
+    value: function parseVTTCues_(segmentInfo) {
+      var decoder = undefined;
+      var decodeBytesToString = false;
+
+      if (typeof _globalWindow2['default'].TextDecoder === 'function') {
+        decoder = new _globalWindow2['default'].TextDecoder('utf8');
+      } else {
+        decoder = _globalWindow2['default'].WebVTT.StringDecoder();
+        decodeBytesToString = true;
+      }
+
+      var parser = new _globalWindow2['default'].WebVTT.Parser(_globalWindow2['default'], _globalWindow2['default'].vttjs, decoder);
+
+      segmentInfo.cues = [];
+      segmentInfo.timestampmap = { MPEGTS: 0, LOCAL: 0 };
+
+      parser.oncue = segmentInfo.cues.push.bind(segmentInfo.cues);
+      parser.ontimestampmap = function (map) {
+        return segmentInfo.timestampmap = map;
+      };
+      parser.onparsingerror = function (error) {
+        _videoJs2['default'].log.warn('Error encountered when parsing cues: ' + error.message);
+      };
+
+      if (segmentInfo.segment.map) {
+        var mapData = segmentInfo.segment.map.bytes;
+
+        if (decodeBytesToString) {
+          mapData = uintToString(mapData);
+        }
+
+        parser.parse(mapData);
+      }
+
+      var segmentData = segmentInfo.bytes;
+
+      if (decodeBytesToString) {
+        segmentData = uintToString(segmentData);
+      }
+
+      parser.parse(segmentData);
+      parser.flush();
+    }
+
+    /**
+     * Updates the start and end times of any cues parsed by the WebVTT parser using
+     * the information parsed from the X-TIMESTAMP-MAP header and a TS to media time mapping
+     * from the SyncController
+     *
+     * @param {Object} segmentInfo
+     *        a segment info object that describes the current segment
+     * @param {Object} mappingObj
+     *        object containing a mapping from TS to media time
+     * @param {Object} playlist
+     *        the playlist object containing the segment
+     * @private
+     */
+  }, {
+    key: 'updateTimeMapping_',
+    value: function updateTimeMapping_(segmentInfo, mappingObj, playlist) {
+      var segment = segmentInfo.segment;
+
+      if (!mappingObj) {
+        // If the sync controller does not have a mapping of TS to Media Time for the
+        // timeline, then we don't have enough information to update the cue
+        // start/end times
+        return;
+      }
+
+      if (!segmentInfo.cues.length) {
+        // If there are no cues, we also do not have enough information to figure out
+        // segment timing. Mark that the segment contains no cues so we don't re-request
+        // an empty segment.
+        segment.empty = true;
+        return;
+      }
+
+      var timestampmap = segmentInfo.timestampmap;
+      var diff = timestampmap.MPEGTS / 90000 - timestampmap.LOCAL + mappingObj.mapping;
+
+      segmentInfo.cues.forEach(function (cue) {
+        // First convert cue time to TS time using the timestamp-map provided within the vtt
+        cue.startTime += diff;
+        cue.endTime += diff;
+      });
+
+      if (!playlist.syncInfo) {
+        var firstStart = segmentInfo.cues[0].startTime;
+        var lastStart = segmentInfo.cues[segmentInfo.cues.length - 1].startTime;
+
+        playlist.syncInfo = {
+          mediaSequence: playlist.mediaSequence + segmentInfo.mediaIndex,
+          time: Math.min(firstStart, lastStart - segment.duration)
+        };
+      }
+    }
+  }]);
+
+  return VTTSegmentLoader;
+})(_segmentLoader2['default']);
+
+exports['default'] = VTTSegmentLoader;
+module.exports = exports['default'];
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./bin-utils":2,"./segment-loader":15,"global/window":30,"videojs-contrib-media-sources/es5/remove-cues-from-track.js":71}],19:[function(require,module,exports){
 (function (global){
 /**
  * @file xhr.js
@@ -5966,7 +7696,11 @@ Object.defineProperty(exports, '__esModule', {
   value: true
 });
 
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
+
 var _videoJs = (typeof window !== "undefined" ? window['videojs'] : typeof global !== "undefined" ? global['videojs'] : null);
+
+var _videoJs2 = _interopRequireDefault(_videoJs);
 
 var xhrFactory = function xhrFactory() {
   var xhr = function XhrFunction(options, callback) {
@@ -5977,8 +7711,10 @@ var xhrFactory = function xhrFactory() {
 
     // Allow an optional user-specified function to modify the option
     // object before we construct the xhr request
-    if (XhrFunction.beforeRequest && typeof XhrFunction.beforeRequest === 'function') {
-      var newOptions = XhrFunction.beforeRequest(options);
+    var beforeRequest = XhrFunction.beforeRequest || _videoJs2['default'].Hls.xhr.beforeRequest;
+
+    if (beforeRequest && typeof beforeRequest === 'function') {
+      var newOptions = beforeRequest(options);
 
       if (newOptions) {
         options = newOptions;
@@ -5986,34 +7722,39 @@ var xhrFactory = function xhrFactory() {
     }
 
     var request = (0, _videoJs.xhr)(options, function (error, response) {
-      if (!error && request.response) {
+      var reqResponse = request.response;
+
+      if (!error && reqResponse) {
         request.responseTime = Date.now();
         request.roundTripTime = request.responseTime - request.requestTime;
-        request.bytesReceived = request.response.byteLength || request.response.length;
+        request.bytesReceived = reqResponse.byteLength || reqResponse.length;
         if (!request.bandwidth) {
           request.bandwidth = Math.floor(request.bytesReceived / request.roundTripTime * 8 * 1000);
         }
       }
 
-      // videojs.xhr now uses a specific code
-      // on the error object to signal that a request has
-      // timed out errors of setting a boolean on the request object
-      if (error || request.timedout) {
-        request.timedout = request.timedout || error.code === 'ETIMEDOUT';
-      } else {
-        request.timedout = false;
+      // videojs.xhr now uses a specific code on the error
+      // object to signal that a request has timed out instead
+      // of setting a boolean on the request object
+      if (error && error.code === 'ETIMEDOUT') {
+        request.timedout = true;
       }
 
       // videojs.xhr no longer considers status codes outside of 200 and 0
       // (for file uris) to be errors, but the old XHR did, so emulate that
       // behavior. Status 206 may be used in response to byterange requests.
-      if (!error && response.statusCode !== 200 && response.statusCode !== 206 && response.statusCode !== 0) {
-        error = new Error('XHR Failed with a response of: ' + (request && (request.response || request.responseText)));
+      if (!error && !request.aborted && response.statusCode !== 200 && response.statusCode !== 206 && response.statusCode !== 0) {
+        error = new Error('XHR Failed with a response of: ' + (request && (reqResponse || request.responseText)));
       }
 
       callback(error, request);
     });
+    var originalAbort = request.abort;
 
+    request.abort = function () {
+      request.aborted = true;
+      return originalAbort.apply(request, arguments);
+    };
     request.uri = options.uri;
     request.requestTime = Date.now();
     return request;
@@ -6025,7 +7766,7 @@ var xhrFactory = function xhrFactory() {
 exports['default'] = xhrFactory;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],19:[function(require,module,exports){
+},{}],20:[function(require,module,exports){
 /**
  * @file aes.js
  *
@@ -6271,7 +8012,7 @@ var AES = (function () {
 
 exports['default'] = AES;
 module.exports = exports['default'];
-},{}],20:[function(require,module,exports){
+},{}],21:[function(require,module,exports){
 /**
  * @file async-stream.js
  */
@@ -6352,7 +8093,7 @@ var AsyncStream = (function (_Stream) {
 
 exports['default'] = AsyncStream;
 module.exports = exports['default'];
-},{"./stream":23}],21:[function(require,module,exports){
+},{"./stream":24}],22:[function(require,module,exports){
 /**
  * @file decrypter.js
  *
@@ -6536,7 +8277,7 @@ exports['default'] = {
   Decrypter: Decrypter,
   decrypt: decrypt
 };
-},{"./aes":19,"./async-stream":20,"pkcs7":25}],22:[function(require,module,exports){
+},{"./aes":20,"./async-stream":21,"pkcs7":26}],23:[function(require,module,exports){
 /**
  * @file index.js
  *
@@ -6567,9 +8308,138 @@ exports['default'] = {
   AsyncStream: _asyncStream2['default']
 };
 module.exports = exports['default'];
-},{"./async-stream":20,"./decrypter":21}],23:[function(require,module,exports){
-arguments[4][16][0].apply(exports,arguments)
-},{"dup":16}],24:[function(require,module,exports){
+},{"./async-stream":21,"./decrypter":22}],24:[function(require,module,exports){
+/**
+ * @file stream.js
+ */
+/**
+ * A lightweight readable stream implemention that handles event dispatching.
+ *
+ * @class Stream
+ */
+'use strict';
+
+Object.defineProperty(exports, '__esModule', {
+  value: true
+});
+
+var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ('value' in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError('Cannot call a class as a function'); } }
+
+var Stream = (function () {
+  function Stream() {
+    _classCallCheck(this, Stream);
+
+    this.listeners = {};
+  }
+
+  /**
+   * Add a listener for a specified event type.
+   *
+   * @param {String} type the event name
+   * @param {Function} listener the callback to be invoked when an event of
+   * the specified type occurs
+   */
+
+  _createClass(Stream, [{
+    key: 'on',
+    value: function on(type, listener) {
+      if (!this.listeners[type]) {
+        this.listeners[type] = [];
+      }
+      this.listeners[type].push(listener);
+    }
+
+    /**
+     * Remove a listener for a specified event type.
+     *
+     * @param {String} type the event name
+     * @param {Function} listener  a function previously registered for this
+     * type of event through `on`
+     * @return {Boolean} if we could turn it off or not
+     */
+  }, {
+    key: 'off',
+    value: function off(type, listener) {
+      var index = undefined;
+
+      if (!this.listeners[type]) {
+        return false;
+      }
+      index = this.listeners[type].indexOf(listener);
+      this.listeners[type].splice(index, 1);
+      return index > -1;
+    }
+
+    /**
+     * Trigger an event of the specified type on this stream. Any additional
+     * arguments to this function are passed as parameters to event listeners.
+     *
+     * @param {String} type the event name
+     */
+  }, {
+    key: 'trigger',
+    value: function trigger(type) {
+      var callbacks = undefined;
+      var i = undefined;
+      var length = undefined;
+      var args = undefined;
+
+      callbacks = this.listeners[type];
+      if (!callbacks) {
+        return;
+      }
+      // Slicing the arguments on every invocation of this method
+      // can add a significant amount of overhead. Avoid the
+      // intermediate object creation for the common case of a
+      // single callback argument
+      if (arguments.length === 2) {
+        length = callbacks.length;
+        for (i = 0; i < length; ++i) {
+          callbacks[i].call(this, arguments[1]);
+        }
+      } else {
+        args = Array.prototype.slice.call(arguments, 1);
+        length = callbacks.length;
+        for (i = 0; i < length; ++i) {
+          callbacks[i].apply(this, args);
+        }
+      }
+    }
+
+    /**
+     * Destroys the stream and cleans up.
+     */
+  }, {
+    key: 'dispose',
+    value: function dispose() {
+      this.listeners = {};
+    }
+
+    /**
+     * Forwards all `data` events on this stream to the destination stream. The
+     * destination stream should provide a method `push` to receive the data
+     * events as they arrive.
+     *
+     * @param {Stream} destination the stream that will receive all `data` events
+     * @see http://nodejs.org/api/stream.html#stream_readable_pipe_destination_options
+     */
+  }, {
+    key: 'pipe',
+    value: function pipe(destination) {
+      this.on('data', function (data) {
+        destination.push(data);
+      });
+    }
+  }]);
+
+  return Stream;
+})();
+
+exports['default'] = Stream;
+module.exports = exports['default'];
+},{}],25:[function(require,module,exports){
 /*
  * pkcs7.pad
  * https://github.com/brightcove/pkcs7
@@ -6655,7 +8525,7 @@ PADDING = [
   [1]
 ];
 
-},{}],25:[function(require,module,exports){
+},{}],26:[function(require,module,exports){
 /*
  * pkcs7
  * https://github.com/brightcove/pkcs7
@@ -6669,7 +8539,7 @@ PADDING = [
 exports.pad = require('./pad.js');
 exports.unpad = require('./unpad.js');
 
-},{"./pad.js":24,"./unpad.js":26}],26:[function(require,module,exports){
+},{"./pad.js":25,"./unpad.js":27}],27:[function(require,module,exports){
 /*
  * pkcs7.unpad
  * https://github.com/brightcove/pkcs7
@@ -6690,9 +8560,9 @@ module.exports = function unpad(padded) {
   return padded.subarray(0, padded.byteLength - padded[padded.byteLength - 1]);
 };
 
-},{}],27:[function(require,module,exports){
-
 },{}],28:[function(require,module,exports){
+
+},{}],29:[function(require,module,exports){
 (function (global){
 var topLevel = typeof global !== 'undefined' ? global :
     typeof window !== 'undefined' ? window : {}
@@ -6711,7 +8581,7 @@ if (typeof document !== 'undefined') {
 }
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"min-document":27}],29:[function(require,module,exports){
+},{"min-document":28}],30:[function(require,module,exports){
 (function (global){
 if (typeof window !== "undefined") {
     module.exports = window;
@@ -6724,7 +8594,7 @@ if (typeof window !== "undefined") {
 }
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],30:[function(require,module,exports){
+},{}],31:[function(require,module,exports){
 'use strict';
 
 var _lineStream = require('./line-stream');
@@ -6754,7 +8624,7 @@ module.exports = {
     * that do not assume the entirety of the manifest is ready and expose a
     * ReadableStream-like interface.
     */
-},{"./line-stream":31,"./parse-stream":32,"./parser":33}],31:[function(require,module,exports){
+},{"./line-stream":32,"./parse-stream":33,"./parser":34}],32:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -6823,7 +8693,7 @@ var LineStream = function (_Stream) {
 }(_stream2['default']);
 
 exports['default'] = LineStream;
-},{"./stream":34}],32:[function(require,module,exports){
+},{"./stream":35}],33:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -7276,7 +9146,7 @@ var ParseStream = function (_Stream) {
 }(_stream2['default']);
 
 exports['default'] = ParseStream;
-},{"./stream":34}],33:[function(require,module,exports){
+},{"./stream":35}],34:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -7667,7 +9537,7 @@ var Parser = function (_Stream) {
 }(_stream2['default']);
 
 exports['default'] = Parser;
-},{"./line-stream":31,"./parse-stream":32,"./stream":34}],34:[function(require,module,exports){
+},{"./line-stream":32,"./parse-stream":33,"./stream":35}],35:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -7800,7 +9670,7 @@ var Stream = function () {
 }();
 
 exports['default'] = Stream;
-},{}],35:[function(require,module,exports){
+},{}],36:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -7945,7 +9815,7 @@ AacStream.prototype = new Stream();
 
 module.exports = AacStream;
 
-},{"../utils/stream.js":59}],36:[function(require,module,exports){
+},{"../utils/stream.js":60}],37:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -8108,7 +9978,7 @@ module.exports = {
   parseAacTimestamp: parseAacTimestamp
 };
 
-},{}],37:[function(require,module,exports){
+},{}],38:[function(require,module,exports){
 'use strict';
 
 var Stream = require('../utils/stream.js');
@@ -8242,7 +10112,7 @@ AdtsStream.prototype = new Stream();
 
 module.exports = AdtsStream;
 
-},{"../utils/stream.js":59}],38:[function(require,module,exports){
+},{"../utils/stream.js":60}],39:[function(require,module,exports){
 'use strict';
 
 var Stream = require('../utils/stream.js');
@@ -8662,7 +10532,7 @@ module.exports = {
   NalByteStream: NalByteStream
 };
 
-},{"../utils/exp-golomb.js":58,"../utils/stream.js":59}],39:[function(require,module,exports){
+},{"../utils/exp-golomb.js":59,"../utils/stream.js":60}],40:[function(require,module,exports){
 var highPrefix = [33, 16, 5, 32, 164, 27];
 var lowPrefix = [33, 65, 108, 84, 1, 2, 4, 8, 168, 2, 4, 8, 17, 191, 252];
 var zeroFill = function(count) {
@@ -8699,7 +10569,7 @@ var coneOfSilence = {
 
 module.exports = makeTable(coneOfSilence);
 
-},{}],40:[function(require,module,exports){
+},{}],41:[function(require,module,exports){
 'use strict';
 
 var Stream = require('../utils/stream.js');
@@ -8844,7 +10714,7 @@ CoalesceStream.prototype.flush = function(flushSource) {
 
 module.exports = CoalesceStream;
 
-},{"../utils/stream.js":59}],41:[function(require,module,exports){
+},{"../utils/stream.js":60}],42:[function(require,module,exports){
 'use strict';
 
 var FlvTag = require('./flv-tag.js');
@@ -8906,7 +10776,7 @@ var getFlvHeader = function(duration, audio, video) { // :ByteArray {
 
 module.exports = getFlvHeader;
 
-},{"./flv-tag.js":42}],42:[function(require,module,exports){
+},{"./flv-tag.js":43}],43:[function(require,module,exports){
 /**
  * An object that stores the bytes of an FLV tag and methods for
  * querying and manipulating that data.
@@ -9280,14 +11150,14 @@ FlvTag.frameTime = function(tag) {
 
 module.exports = FlvTag;
 
-},{}],43:[function(require,module,exports){
+},{}],44:[function(require,module,exports){
 module.exports = {
   tag: require('./flv-tag'),
   Transmuxer: require('./transmuxer'),
   getFlvHeader: require('./flv-header')
 };
 
-},{"./flv-header":41,"./flv-tag":42,"./transmuxer":45}],44:[function(require,module,exports){
+},{"./flv-header":42,"./flv-tag":43,"./transmuxer":46}],45:[function(require,module,exports){
 'use strict';
 
 var TagList = function() {
@@ -9314,7 +11184,7 @@ var TagList = function() {
 
 module.exports = TagList;
 
-},{}],45:[function(require,module,exports){
+},{}],46:[function(require,module,exports){
 'use strict';
 
 var Stream = require('../utils/stream.js');
@@ -9732,7 +11602,7 @@ Transmuxer.prototype = new Stream();
 // forward compatibility
 module.exports = Transmuxer;
 
-},{"../codecs/adts.js":37,"../codecs/h264":38,"../m2ts/m2ts.js":47,"../utils/stream.js":59,"./coalesce-stream.js":40,"./flv-tag.js":42,"./tag-list.js":44}],46:[function(require,module,exports){
+},{"../codecs/adts.js":38,"../codecs/h264":39,"../m2ts/m2ts.js":48,"../utils/stream.js":60,"./coalesce-stream.js":41,"./flv-tag.js":43,"./tag-list.js":45}],47:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -10198,7 +12068,7 @@ module.exports = {
   Cea608Stream: Cea608Stream
 };
 
-},{"../utils/stream":59}],47:[function(require,module,exports){
+},{"../utils/stream":60}],48:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -10471,6 +12341,9 @@ ElementaryStream = function() {
     parsePes = function(payload, pes) {
       var ptsDtsFlags;
 
+      // get the packet length, this will be 0 for video
+      pes.packetLength = 6 + ((payload[4] << 8) | payload[5]);
+
       // find out if this packets starts a new keyframe
       pes.dataAlignmentIndicator = (payload[6] & 0x04) !== 0;
       // PES packets may be annotated with a PTS value, or a PTS value
@@ -10513,35 +12386,50 @@ ElementaryStream = function() {
       // that follow the last byte of the field.
       pes.data = payload.subarray(9 + payload[8]);
     },
-    flushStream = function(stream, type) {
+    flushStream = function(stream, type, forceFlush) {
       var
         packetData = new Uint8Array(stream.size),
         event = {
           type: type
         },
         i = 0,
+        offset = 0,
+        packetFlushable = false,
         fragment;
 
-      // do nothing if there is no buffered data
-      if (!stream.data.length) {
+      // do nothing if there is not enough buffered data for a complete
+      // PES header
+      if (!stream.data.length || stream.size < 9) {
         return;
       }
       event.trackId = stream.data[0].pid;
 
       // reassemble the packet
-      while (stream.data.length) {
-        fragment = stream.data.shift();
+      for (i = 0; i < stream.data.length; i++) {
+        fragment = stream.data[i];
 
-        packetData.set(fragment.data, i);
-        i += fragment.data.byteLength;
+        packetData.set(fragment.data, offset);
+        offset += fragment.data.byteLength;
       }
 
       // parse assembled packet's PES header
       parsePes(packetData, event);
 
-      stream.size = 0;
+      // non-video PES packets MUST have a non-zero PES_packet_length
+      // check that they match before we do a flush
+      packetFlushable = type === 'video' || event.packetLength === stream.size;
 
-      self.trigger('data', event);
+      // flush pending packets if the conditions are right
+      if (forceFlush || packetFlushable) {
+        stream.size = 0;
+        stream.data.length = 0;
+      }
+
+      // only emit packets that are complete. this is to avoid assembling
+      // incomplete PES packets due to poor segmentation
+      if (packetFlushable) {
+        self.trigger('data', event);
+      }
     };
 
   ElementaryStream.prototype.init.call(this);
@@ -10577,7 +12465,7 @@ ElementaryStream = function() {
         // if a new packet is starting, we can flush the completed
         // packet
         if (data.payloadUnitStartIndicator) {
-          flushStream(stream, streamType);
+          flushStream(stream, streamType, true);
         }
 
         // buffer this fragment until we are sure we've received the
@@ -10659,7 +12547,7 @@ for (var type in StreamTypes) {
 
 module.exports = m2ts;
 
-},{"../utils/stream.js":59,"./caption-stream":46,"./metadata-stream":48,"./stream-types":50,"./stream-types.js":50,"./timestamp-rollover-stream":51}],48:[function(require,module,exports){
+},{"../utils/stream.js":60,"./caption-stream":47,"./metadata-stream":49,"./stream-types":51,"./stream-types.js":51,"./timestamp-rollover-stream":52}],49:[function(require,module,exports){
 /**
  * Accepts program elementary stream (PES) data events and parses out
  * ID3 metadata from them, if present.
@@ -10707,7 +12595,7 @@ var
           // parse the text fields
           tag.description = parseUtf8(tag.data, 1, i);
           // do not include the null terminator in the tag value
-          tag.value = parseUtf8(tag.data, i + 1, tag.data.length - 1);
+          tag.value = parseUtf8(tag.data, i + 1, tag.data.length).replace(/\0*$/, '');
           break;
         }
       }
@@ -10909,7 +12797,7 @@ MetadataStream.prototype = new Stream();
 
 module.exports = MetadataStream;
 
-},{"../utils/stream":59,"./stream-types":50}],49:[function(require,module,exports){
+},{"../utils/stream":60,"./stream-types":51}],50:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -11033,7 +12921,21 @@ var parsePesTime = function(packet) {
 
   var offset = 4 + parseAdaptionField(packet);
 
-  var pes = {};
+  if (offset >= packet.byteLength) {
+    // From the H 222.0 MPEG-TS spec
+    // "For transport stream packets carrying PES packets, stuffing is needed when there
+    //  is insufficient PES packet data to completely fill the transport stream packet
+    //  payload bytes. Stuffing is accomplished by defining an adaptation field longer than
+    //  the sum of the lengths of the data elements in it, so that the payload bytes
+    //  remaining after the adaptation field exactly accommodates the available PES packet
+    //  data."
+    //
+    // If the offset is >= the length of the packet, then the packet contains no data
+    // and instead is just adaption field stuffing bytes
+    return null;
+  }
+
+  var pes = null;
   var ptsDtsFlags;
 
   // PES packets may be annotated with a PTS value, or a PTS value
@@ -11050,6 +12952,7 @@ var parsePesTime = function(packet) {
   // of 2) before we add the final 2 least significant bits of the
   // timestamp (equal to an OR.)
   if (ptsDtsFlags & 0xC0) {
+    pes = {};
     // the PTS and DTS are not written out directly. For information
     // on how they are encoded, see
     // http://dvd.sourceforge.net/dvdinfo/pes-hdr.html
@@ -11183,7 +13086,7 @@ module.exports = {
   videoPacketContainsKeyFrame: videoPacketContainsKeyFrame
 };
 
-},{"./stream-types.js":50}],50:[function(require,module,exports){
+},{"./stream-types.js":51}],51:[function(require,module,exports){
 'use strict';
 
 module.exports = {
@@ -11192,7 +13095,7 @@ module.exports = {
   METADATA_STREAM_TYPE: 0x15
 };
 
-},{}],51:[function(require,module,exports){
+},{}],52:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -11264,6 +13167,11 @@ var TimestampRolloverStream = function(type) {
     this.trigger('done');
   };
 
+  this.discontinuity = function() {
+    referenceDTS = void 0;
+    lastDTS = void 0;
+  };
+
 };
 
 TimestampRolloverStream.prototype = new Stream();
@@ -11273,7 +13181,7 @@ module.exports = {
   handleRollover: handleRollover
 };
 
-},{"../utils/stream":59}],52:[function(require,module,exports){
+},{"../utils/stream":60}],53:[function(require,module,exports){
 module.exports = {
   generator: require('./mp4-generator'),
   Transmuxer: require('./transmuxer').Transmuxer,
@@ -11281,7 +13189,7 @@ module.exports = {
   VideoSegmentStream: require('./transmuxer').VideoSegmentStream
 };
 
-},{"./mp4-generator":53,"./transmuxer":55}],53:[function(require,module,exports){
+},{"./mp4-generator":54,"./transmuxer":56}],54:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -12053,7 +13961,7 @@ module.exports = {
   }
 };
 
-},{}],54:[function(require,module,exports){
+},{}],55:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -12243,7 +14151,7 @@ module.exports = {
   startTime: startTime
 };
 
-},{}],55:[function(require,module,exports){
+},{}],56:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -13445,15 +15353,23 @@ Transmuxer = function(options) {
       audioTrack.timelineStartInfo.pts = undefined;
       clearDtsInfo(audioTrack);
       audioTrack.timelineStartInfo.baseMediaDecodeTime = baseMediaDecodeTime;
+      if (pipeline.audioTimestampRolloverStream) {
+        pipeline.audioTimestampRolloverStream.discontinuity();
+      }
     }
     if (videoTrack) {
       if (pipeline.videoSegmentStream) {
         pipeline.videoSegmentStream.gopCache_ = [];
+        pipeline.videoTimestampRolloverStream.discontinuity();
       }
       videoTrack.timelineStartInfo.dts = undefined;
       videoTrack.timelineStartInfo.pts = undefined;
       clearDtsInfo(videoTrack);
       videoTrack.timelineStartInfo.baseMediaDecodeTime = baseMediaDecodeTime;
+    }
+
+    if (pipeline.timedMetadataTimestampRolloverStream) {
+      pipeline.timedMetadataTimestampRolloverStream.discontinuity();
     }
   };
 
@@ -13495,7 +15411,7 @@ module.exports = {
   VIDEO_PROPERTIES: VIDEO_PROPERTIES
 };
 
-},{"../aac":35,"../codecs/adts.js":37,"../codecs/h264":38,"../data/silence":39,"../m2ts/m2ts.js":47,"../utils/clock":57,"../utils/stream.js":59,"./mp4-generator.js":53}],56:[function(require,module,exports){
+},{"../aac":36,"../codecs/adts.js":38,"../codecs/h264":39,"../data/silence":40,"../m2ts/m2ts.js":48,"../utils/clock":58,"../utils/stream.js":60,"./mp4-generator.js":54}],57:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -13603,9 +15519,11 @@ var parseAudioPes_ = function(bytes, pmt, result) {
           pusi = probe.ts.parsePayloadUnitStartIndicator(packet);
           if (pesType === 'audio' && pusi) {
             parsed = probe.ts.parsePesTime(packet);
-            parsed.type = 'audio';
-            result.audio.push(parsed);
-            endLoop = true;
+            if (parsed) {
+              parsed.type = 'audio';
+              result.audio.push(parsed);
+              endLoop = true;
+            }
           }
           break;
         default:
@@ -13645,9 +15563,11 @@ var parseAudioPes_ = function(bytes, pmt, result) {
           pusi = probe.ts.parsePayloadUnitStartIndicator(packet);
           if (pesType === 'audio' && pusi) {
             parsed = probe.ts.parsePesTime(packet);
-            parsed.type = 'audio';
-            result.audio.push(parsed);
-            endLoop = true;
+            if (parsed) {
+              parsed.type = 'audio';
+              result.audio.push(parsed);
+              endLoop = true;
+            }
           }
           break;
         default:
@@ -13704,9 +15624,11 @@ var parseVideoPes_ = function(bytes, pmt, result) {
           if (pesType === 'video') {
             if (pusi && !endLoop) {
               parsed = probe.ts.parsePesTime(packet);
-              parsed.type = 'video';
-              result.video.push(parsed);
-              endLoop = true;
+              if (parsed) {
+                parsed.type = 'video';
+                result.video.push(parsed);
+                endLoop = true;
+              }
             }
             if (!result.firstKeyFrame) {
               if (pusi) {
@@ -13767,9 +15689,11 @@ var parseVideoPes_ = function(bytes, pmt, result) {
           pusi = probe.ts.parsePayloadUnitStartIndicator(packet);
           if (pesType === 'video' && pusi) {
               parsed = probe.ts.parsePesTime(packet);
-              parsed.type = 'video';
-              result.video.push(parsed);
-            endLoop = true;
+              if (parsed) {
+                parsed.type = 'video';
+                result.video.push(parsed);
+                endLoop = true;
+              }
           }
           break;
         default:
@@ -14001,7 +15925,7 @@ module.exports = {
   inspect: inspect
 };
 
-},{"../aac/probe.js":36,"../m2ts/probe.js":49,"../m2ts/stream-types.js":50,"../m2ts/timestamp-rollover-stream.js":51}],57:[function(require,module,exports){
+},{"../aac/probe.js":37,"../m2ts/probe.js":50,"../m2ts/stream-types.js":51,"../m2ts/timestamp-rollover-stream.js":52}],58:[function(require,module,exports){
 var
   ONE_SECOND_IN_TS = 90000, // 90kHz clock
   secondsToVideoTs,
@@ -14044,7 +15968,7 @@ module.exports = {
   videoTsToAudioTs: videoTsToAudioTs
 };
 
-},{}],58:[function(require,module,exports){
+},{}],59:[function(require,module,exports){
 'use strict';
 
 var ExpGolomb;
@@ -14193,7 +16117,7 @@ ExpGolomb = function(workingData) {
 
 module.exports = ExpGolomb;
 
-},{}],59:[function(require,module,exports){
+},{}],60:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -14312,7 +16236,7 @@ Stream.prototype.flush = function(flushSource) {
 
 module.exports = Stream;
 
-},{}],60:[function(require,module,exports){
+},{}],61:[function(require,module,exports){
 /* jshint ignore:start */
 (function(root) { 
 /* jshint ignore:end */
@@ -14415,7 +16339,7 @@ module.exports = Stream;
 })(this);
 /* jshint ignore:end */
 
-},{}],61:[function(require,module,exports){
+},{}],62:[function(require,module,exports){
 (function (global){
 /**
  * @file add-text-track-data.js
@@ -14483,7 +16407,7 @@ var durationOfVideo = function durationOfVideo(duration) {
  *
  * @param {Object} sourceHandler the flash or virtual source buffer
  * @param {Array} captionArray an array of caption data
- * @param {Array} cue an array of meta data
+ * @param {Array} metadataArray an array of meta data
  * @private
  */
 var addTextTrackData = function addTextTrackData(sourceHandler, captionArray, metadataArray) {
@@ -14566,7 +16490,7 @@ exports['default'] = {
 };
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"global/window":29}],62:[function(require,module,exports){
+},{"global/window":30}],63:[function(require,module,exports){
 /**
  * Remove the text track from the player if one with matching kind and
  * label properties already exists on the player
@@ -14605,7 +16529,7 @@ var cleanupTextTracks = function cleanupTextTracks(player) {
   removeExistingTrack(player, 'metadata', 'Timed Metadata');
 };
 exports.cleanupTextTracks = cleanupTextTracks;
-},{}],63:[function(require,module,exports){
+},{}],64:[function(require,module,exports){
 /**
  * @file codec-utils.js
  */
@@ -14693,7 +16617,7 @@ exports['default'] = {
   translateLegacyCodecs: translateLegacyCodecs
 };
 module.exports = exports['default'];
-},{}],64:[function(require,module,exports){
+},{}],65:[function(require,module,exports){
 /**
  * @file create-text-tracks-if-necessary.js
  */
@@ -14723,6 +16647,7 @@ var createTextTracksIfNecessary = function createTextTracksIfNecessary(sourceBuf
       kind: 'captions',
       label: 'cc1'
     }, false).track;
+    player.tech_.trigger({ type: 'usage', name: 'hls-608' });
   }
 
   if (segment.metadata && segment.metadata.length && !sourceBuffer.metadataTrack_) {
@@ -14737,7 +16662,7 @@ var createTextTracksIfNecessary = function createTextTracksIfNecessary(sourceBuf
 
 exports['default'] = createTextTracksIfNecessary;
 module.exports = exports['default'];
-},{"./cleanup-text-tracks":62}],65:[function(require,module,exports){
+},{"./cleanup-text-tracks":63}],66:[function(require,module,exports){
 /**
  * @file flash-constants.js
  */
@@ -14764,7 +16689,7 @@ var flashConstants = {
 
 exports["default"] = flashConstants;
 module.exports = exports["default"];
-},{}],66:[function(require,module,exports){
+},{}],67:[function(require,module,exports){
 (function (global){
 /**
  * @file flash-media-source.js
@@ -14980,7 +16905,7 @@ for (var property in _flashConstants2['default']) {
 }
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./cleanup-text-tracks":62,"./codec-utils":63,"./flash-constants":65,"./flash-source-buffer":67,"global/document":28}],67:[function(require,module,exports){
+},{"./cleanup-text-tracks":63,"./codec-utils":64,"./flash-constants":66,"./flash-source-buffer":68,"global/document":29}],68:[function(require,module,exports){
 (function (global){
 /**
  * @file flash-source-buffer.js
@@ -15582,7 +17507,7 @@ var FlashSourceBuffer = (function (_videojs$EventTarget) {
 exports['default'] = FlashSourceBuffer;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./add-text-track-data":61,"./create-text-tracks-if-necessary":64,"./flash-constants":65,"./flash-transmuxer-worker":68,"./remove-cues-from-track":70,"global/window":29,"mux.js/lib/flv":43,"webworkify":74}],68:[function(require,module,exports){
+},{"./add-text-track-data":62,"./create-text-tracks-if-necessary":65,"./flash-constants":66,"./flash-transmuxer-worker":69,"./remove-cues-from-track":71,"global/window":30,"mux.js/lib/flv":44,"webworkify":75}],69:[function(require,module,exports){
 /**
  * @file flash-transmuxer-worker.js
  */
@@ -15727,7 +17652,7 @@ exports['default'] = function (self) {
 };
 
 module.exports = exports['default'];
-},{"global/window":29,"mux.js/lib/flv":43}],69:[function(require,module,exports){
+},{"global/window":30,"mux.js/lib/flv":44}],70:[function(require,module,exports){
 (function (global){
 /**
  * @file html-media-source.js
@@ -16067,7 +17992,7 @@ var HtmlMediaSource = (function (_videojs$EventTarget) {
 exports['default'] = HtmlMediaSource;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./add-text-track-data":61,"./cleanup-text-tracks":62,"./codec-utils":63,"./virtual-source-buffer":73,"global/document":28,"global/window":29}],70:[function(require,module,exports){
+},{"./add-text-track-data":62,"./cleanup-text-tracks":63,"./codec-utils":64,"./virtual-source-buffer":74,"global/document":29,"global/window":30}],71:[function(require,module,exports){
 /**
  * @file remove-cues-from-track.js
  */
@@ -16111,7 +18036,7 @@ var removeCuesFromTrack = function removeCuesFromTrack(start, end, track) {
 
 exports["default"] = removeCuesFromTrack;
 module.exports = exports["default"];
-},{}],71:[function(require,module,exports){
+},{}],72:[function(require,module,exports){
 /**
  * @file transmuxer-worker.js
  */
@@ -16315,7 +18240,7 @@ exports['default'] = function (self) {
 };
 
 module.exports = exports['default'];
-},{"global/window":29,"mux.js/lib/mp4":52}],72:[function(require,module,exports){
+},{"global/window":30,"mux.js/lib/mp4":53}],73:[function(require,module,exports){
 (function (global){
 /**
  * @file videojs-contrib-media-sources.js
@@ -16474,7 +18399,7 @@ exports.URL = URL;
 _videoJs2['default'].MediaSource = MediaSource;
 _videoJs2['default'].URL = URL;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./flash-media-source":66,"./html-media-source":69,"global/window":29}],73:[function(require,module,exports){
+},{"./flash-media-source":67,"./html-media-source":70,"global/window":30}],74:[function(require,module,exports){
 (function (global){
 /**
  * @file virtual-source-buffer.js
@@ -16519,6 +18444,41 @@ var _transmuxerWorker2 = _interopRequireDefault(_transmuxerWorker);
 
 var _codecUtils = require('./codec-utils');
 
+// We create a wrapper around the SourceBuffer so that we can manage the
+// state of the `updating` property manually. We have to do this because
+// Firefox changes `updating` to false long before triggering `updateend`
+// events and that was causing strange problems in videojs-contrib-hls
+var makeWrappedSourceBuffer = function makeWrappedSourceBuffer(mediaSource, mimeType) {
+  var sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+  var wrapper = Object.create(null);
+
+  wrapper.updating = false;
+  wrapper.realBuffer_ = sourceBuffer;
+
+  var _loop = function (key) {
+    if (typeof sourceBuffer[key] === 'function') {
+      wrapper[key] = function () {
+        return sourceBuffer[key].apply(sourceBuffer, arguments);
+      };
+    } else if (typeof wrapper[key] === 'undefined') {
+      Object.defineProperty(wrapper, key, {
+        get: function get() {
+          return sourceBuffer[key];
+        },
+        set: function set(v) {
+          return sourceBuffer[key] = v;
+        }
+      });
+    }
+  };
+
+  for (var key in sourceBuffer) {
+    _loop(key);
+  }
+
+  return wrapper;
+};
+
 /**
  * VirtualSourceBuffers exist so that we can transmux non native formats
  * into a native format, but keep the same api as a native source buffer.
@@ -16545,6 +18505,7 @@ var VirtualSourceBuffer = (function (_videojs$EventTarget) {
     this.timestampOffset_ = 0;
     this.pendingBuffers_ = [];
     this.bufferUpdating_ = false;
+
     this.mediaSource_ = mediaSource;
     this.codecs_ = codecs;
     this.audioCodec_ = null;
@@ -16787,8 +18748,23 @@ var VirtualSourceBuffer = (function (_videojs$EventTarget) {
         // use that
         if (_this2.mediaSource_[type + 'Buffer_']) {
           buffer = _this2.mediaSource_[type + 'Buffer_'];
+          // In multiple audio track cases, the audio source buffer is disabled
+          // on the main VirtualSourceBuffer by the HTMLMediaSource much earlier
+          // than createRealSourceBuffers_ is called to create the second
+          // VirtualSourceBuffer because that happens as a side-effect of
+          // videojs-contrib-hls starting the audioSegmentLoader. As a result,
+          // the audioBuffer is essentially "ownerless" and no one will toggle
+          // the `updating` state back to false once the `updateend` event is received
+          //
+          // Setting `updating` to false manually will work around this
+          // situation and allow work to continue
+          buffer.updating = false;
         } else {
-          buffer = _this2.mediaSource_.nativeMediaSource_.addSourceBuffer(type + '/mp4;codecs="' + _this2[type + 'Codec_'] + '"');
+          var codecProperty = type + 'Codec_';
+          var mimeType = type + '/mp4;codecs="' + _this2[codecProperty] + '"';
+
+          buffer = makeWrappedSourceBuffer(_this2.mediaSource_.nativeMediaSource_, mimeType);
+
           _this2.mediaSource_[type + 'Buffer_'] = buffer;
         }
 
@@ -16800,6 +18776,10 @@ var VirtualSourceBuffer = (function (_videojs$EventTarget) {
             // if audio is disabled
             if (type === 'audio' && _this2.audioDisabled_) {
               return;
+            }
+
+            if (event === 'updateend') {
+              _this2[type + 'Buffer_'].updating = false;
             }
 
             var shouldTrigger = types.every(function (t) {
@@ -16874,9 +18854,11 @@ var VirtualSourceBuffer = (function (_videojs$EventTarget) {
     key: 'remove',
     value: function remove(start, end) {
       if (this.videoBuffer_) {
+        this.videoBuffer_.updating = true;
         this.videoBuffer_.remove(start, end);
       }
-      if (this.audioBuffer_) {
+      if (!this.audioDisabled_ && this.audioBuffer_) {
+        this.audioBuffer_.updating = true;
         this.audioBuffer_.remove(start, end);
       }
 
@@ -16977,6 +18959,7 @@ var VirtualSourceBuffer = (function (_videojs$EventTarget) {
         // TODO: are video tracks the only ones with text tracks?
         (0, _addTextTrackData.addTextTrackData)(this, sortedSegments.captions, sortedSegments.metadata);
       }
+
       if (!this.audioDisabled_ && this.audioBuffer_) {
         this.concatAndAppendSegments_(sortedSegments.audio, this.audioBuffer_);
       }
@@ -17011,6 +18994,7 @@ var VirtualSourceBuffer = (function (_videojs$EventTarget) {
         });
 
         try {
+          destinationBuffer.updating = true;
           destinationBuffer.appendBuffer(tempBuffer);
         } catch (error) {
           if (this.mediaSource_.player_) {
@@ -17037,7 +19021,7 @@ var VirtualSourceBuffer = (function (_videojs$EventTarget) {
       if (this.videoBuffer_) {
         this.videoBuffer_.abort();
       }
-      if (this.audioBuffer_) {
+      if (!this.audioDisabled_ && this.audioBuffer_) {
         this.audioBuffer_.abort();
       }
       if (this.transmuxer_) {
@@ -17054,7 +19038,7 @@ var VirtualSourceBuffer = (function (_videojs$EventTarget) {
 exports['default'] = VirtualSourceBuffer;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./add-text-track-data":61,"./codec-utils":63,"./create-text-tracks-if-necessary":64,"./remove-cues-from-track":70,"./transmuxer-worker":71,"webworkify":74}],74:[function(require,module,exports){
+},{"./add-text-track-data":62,"./codec-utils":64,"./create-text-tracks-if-necessary":65,"./remove-cues-from-track":71,"./transmuxer-worker":72,"webworkify":75}],75:[function(require,module,exports){
 var bundleFn = arguments[3];
 var sources = arguments[4];
 var cache = arguments[5];
@@ -17111,7 +19095,7 @@ module.exports = function (fn) {
     ));
 };
 
-},{}],75:[function(require,module,exports){
+},{}],76:[function(require,module,exports){
 (function (global){
 /**
  * @file videojs-contrib-hls.js
@@ -17123,7 +19107,7 @@ module.exports = function (fn) {
 
 var _createClass = (function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ('value' in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
 
-var _get = function get(_x, _x2, _x3) { var _again = true; _function: while (_again) { var object = _x, property = _x2, receiver = _x3; _again = false; if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { _x = parent; _x2 = property; _x3 = receiver; _again = true; desc = parent = undefined; continue _function; } } else if ('value' in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } } };
+var _get = function get(_x4, _x5, _x6) { var _again = true; _function: while (_again) { var object = _x4, property = _x5, receiver = _x6; _again = false; if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { _x4 = parent; _x5 = property; _x6 = receiver; _again = true; desc = parent = undefined; continue _function; } } else if ('value' in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } } };
 
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
 
@@ -17185,6 +19169,13 @@ var _reloadSourceOnError = require('./reload-source-on-error');
 
 var _reloadSourceOnError2 = _interopRequireDefault(_reloadSourceOnError);
 
+var _playlistSelectorsJs = require('./playlist-selectors.js');
+
+// 0.5 MB/s
+var INITIAL_BANDWIDTH_DESKTOP = 4194304;
+// 0.0625 MB/s
+var INITIAL_BANDWIDTH_MOBILE = 500000;
+
 var Hls = {
   PlaylistLoader: _playlistLoader2['default'],
   Playlist: _playlist2['default'],
@@ -17192,52 +19183,33 @@ var Hls = {
   AsyncStream: _aesDecrypter.AsyncStream,
   decrypt: _aesDecrypter.decrypt,
   utils: _binUtils2['default'],
+
+  STANDARD_PLAYLIST_SELECTOR: _playlistSelectorsJs.lastBandwidthSelector,
+  comparePlaylistBandwidth: _playlistSelectorsJs.comparePlaylistBandwidth,
+  comparePlaylistResolution: _playlistSelectorsJs.comparePlaylistResolution,
+
   xhr: (0, _xhr2['default'])()
 };
 
-Object.defineProperty(Hls, 'GOAL_BUFFER_LENGTH', {
-  get: function get() {
-    _videoJs2['default'].log.warn('using Hls.GOAL_BUFFER_LENGTH is UNSAFE be sure ' + 'you know what you are doing');
-    return _config2['default'].GOAL_BUFFER_LENGTH;
-  },
-  set: function set(v) {
-    _videoJs2['default'].log.warn('using Hls.GOAL_BUFFER_LENGTH is UNSAFE be sure ' + 'you know what you are doing');
-    if (typeof v !== 'number' || v <= 0) {
-      _videoJs2['default'].log.warn('value passed to Hls.GOAL_BUFFER_LENGTH ' + 'must be a number and greater than 0');
-      return;
+// Define getter/setters for config properites
+['GOAL_BUFFER_LENGTH', 'MAX_GOAL_BUFFER_LENGTH', 'GOAL_BUFFER_LENGTH_RATE', 'BUFFER_LOW_WATER_LINE', 'MAX_BUFFER_LOW_WATER_LINE', 'BUFFER_LOW_WATER_LINE_RATE', 'BANDWIDTH_VARIANCE'].forEach(function (prop) {
+  Object.defineProperty(Hls, prop, {
+    get: function get() {
+      _videoJs2['default'].log.warn('using Hls.' + prop + ' is UNSAFE be sure you know what you are doing');
+      return _config2['default'][prop];
+    },
+    set: function set(value) {
+      _videoJs2['default'].log.warn('using Hls.' + prop + ' is UNSAFE be sure you know what you are doing');
+
+      if (typeof value !== 'number' || value < 0) {
+        _videoJs2['default'].log.warn('value of Hls.' + prop + ' must be greater than or equal to 0');
+        return;
+      }
+
+      _config2['default'][prop] = value;
     }
-    _config2['default'].GOAL_BUFFER_LENGTH = v;
-  }
+  });
 });
-
-// A fudge factor to apply to advertised playlist bitrates to account for
-// temporary flucations in client bandwidth
-var BANDWIDTH_VARIANCE = 1.2;
-
-/**
- * Returns the CSS value for the specified property on an element
- * using `getComputedStyle`. Firefox has a long-standing issue where
- * getComputedStyle() may return null when running in an iframe with
- * `display: none`.
- *
- * @see https://bugzilla.mozilla.org/show_bug.cgi?id=548397
- * @param {HTMLElement} el the htmlelement to work on
- * @param {string} the proprety to get the style for
- */
-var safeGetComputedStyle = function safeGetComputedStyle(el, property) {
-  var result = undefined;
-
-  if (!el) {
-    return '';
-  }
-
-  result = _globalWindow2['default'].getComputedStyle(el);
-  if (!result) {
-    return '';
-  }
-
-  return result[property];
-};
 
 /**
  * Updates the selectedIndex of the QualityLevelList when a mediachange happens in hls.
@@ -17276,106 +19248,6 @@ var handleHlsLoadedMetadata = function handleHlsLoadedMetadata(qualityLevels, hl
     qualityLevels.addQualityLevel(rep);
   });
   handleHlsMediaChange(qualityLevels, hls.playlists);
-};
-
-/**
- * Resuable stable sort function
- *
- * @param {Playlists} array
- * @param {Function} sortFn Different comparators
- * @function stableSort
- */
-var stableSort = function stableSort(array, sortFn) {
-  var newArray = array.slice();
-
-  array.sort(function (left, right) {
-    var cmp = sortFn(left, right);
-
-    if (cmp === 0) {
-      return newArray.indexOf(left) - newArray.indexOf(right);
-    }
-    return cmp;
-  });
-};
-
-/**
- * Chooses the appropriate media playlist based on the current
- * bandwidth estimate and the player size.
- *
- * @return {Playlist} the highest bitrate playlist less than the currently detected
- * bandwidth, accounting for some amount of bandwidth variance
- */
-Hls.STANDARD_PLAYLIST_SELECTOR = function () {
-  var sortedPlaylists = this.playlists.master.playlists.slice();
-  var bandwidthPlaylists = [];
-  var bandwidthBestVariant = undefined;
-  var resolutionPlusOne = undefined;
-  var resolutionBestVariant = undefined;
-  var width = undefined;
-  var height = undefined;
-  var systemBandwidth = undefined;
-  var haveResolution = undefined;
-  var resolutionPlusOneList = [];
-  var resolutionPlusOneSmallest = [];
-  var resolutionBestVariantList = [];
-
-  stableSort(sortedPlaylists, Hls.comparePlaylistBandwidth);
-
-  // filter out any playlists that have been excluded due to
-  // incompatible configurations or playback errors
-  sortedPlaylists = sortedPlaylists.filter(_playlist2['default'].isEnabled);
-  // filter out any variant that has greater effective bitrate
-  // than the current estimated bandwidth
-  systemBandwidth = this.systemBandwidth;
-  bandwidthPlaylists = sortedPlaylists.filter(function (elem) {
-    return elem.attributes && elem.attributes.BANDWIDTH && elem.attributes.BANDWIDTH * BANDWIDTH_VARIANCE < systemBandwidth;
-  });
-
-  // get all of the renditions with the same (highest) bandwidth
-  // and then taking the very first element
-  bandwidthBestVariant = bandwidthPlaylists.filter(function (elem) {
-    return elem.attributes.BANDWIDTH === bandwidthPlaylists[bandwidthPlaylists.length - 1].attributes.BANDWIDTH;
-  })[0];
-
-  // sort variants by resolution
-  stableSort(bandwidthPlaylists, Hls.comparePlaylistResolution);
-
-  width = parseInt(safeGetComputedStyle(this.tech_.el(), 'width'), 10);
-  height = parseInt(safeGetComputedStyle(this.tech_.el(), 'height'), 10);
-
-  // filter out playlists without resolution information
-  haveResolution = bandwidthPlaylists.filter(function (elem) {
-    return elem.attributes && elem.attributes.RESOLUTION && elem.attributes.RESOLUTION.width && elem.attributes.RESOLUTION.height;
-  });
-
-  // if we have the exact resolution as the player use it
-  resolutionBestVariantList = haveResolution.filter(function (elem) {
-    return elem.attributes.RESOLUTION.width === width && elem.attributes.RESOLUTION.height === height;
-  });
-  // ensure that we pick the highest bandwidth variant that have exact resolution
-  resolutionBestVariant = resolutionBestVariantList.filter(function (elem) {
-    return elem.attributes.BANDWIDTH === resolutionBestVariantList[resolutionBestVariantList.length - 1].attributes.BANDWIDTH;
-  })[0];
-
-  // find the smallest variant that is larger than the player
-  // if there is no match of exact resolution
-  if (!resolutionBestVariant) {
-    resolutionPlusOneList = haveResolution.filter(function (elem) {
-      return elem.attributes.RESOLUTION.width > width || elem.attributes.RESOLUTION.height > height;
-    });
-    // find all the variants have the same smallest resolution
-    resolutionPlusOneSmallest = resolutionPlusOneList.filter(function (elem) {
-      return elem.attributes.RESOLUTION.width === resolutionPlusOneList[0].attributes.RESOLUTION.width && elem.attributes.RESOLUTION.height === resolutionPlusOneList[0].attributes.RESOLUTION.height;
-    });
-    // ensure that we also pick the highest bandwidth variant that
-    // is just-larger-than the video player
-    resolutionPlusOne = resolutionPlusOneSmallest.filter(function (elem) {
-      return elem.attributes.BANDWIDTH === resolutionPlusOneSmallest[resolutionPlusOneSmallest.length - 1].attributes.BANDWIDTH;
-    })[0];
-  }
-
-  // fallback chain of variants
-  return resolutionPlusOne || resolutionBestVariant || bandwidthBestVariant || sortedPlaylists[0];
 };
 
 // HLS is a source handler, not a tech. Make sure attempts to use it
@@ -17463,7 +19335,7 @@ var HlsHandler = (function (_Component) {
 
     _classCallCheck(this, HlsHandler);
 
-    _get(Object.getPrototypeOf(HlsHandler.prototype), 'constructor', this).call(this, tech);
+    _get(Object.getPrototypeOf(HlsHandler.prototype), 'constructor', this).call(this, tech, options.hls);
 
     // tech.player() is deprecated but setup a reference to HLS for
     // backwards-compatibility
@@ -17474,26 +19346,24 @@ var HlsHandler = (function (_Component) {
         Object.defineProperty(_player, 'hls', {
           get: function get() {
             _videoJs2['default'].log.warn('player.hls is deprecated. Use player.tech_.hls instead.');
+            tech.trigger({ type: 'usage', name: 'hls-player-access' });
             return _this;
           }
         });
       }
     }
 
-    // overriding native HLS only works if audio tracks have been emulated
-    // error early if we're misconfigured:
-    if (_videoJs2['default'].options.hls.overrideNative && (tech.featuresNativeVideoTracks || tech.featuresNativeAudioTracks)) {
-      throw new Error('Overriding native HLS requires emulated tracks. ' + 'See https://git.io/vMpjB');
-    }
-
     this.tech_ = tech;
     this.source_ = source;
     this.stats = {};
     this.ignoreNextSeekingEvent_ = false;
-
-    // handle global & Source Handler level options
-    this.options_ = _videoJs2['default'].mergeOptions(_videoJs2['default'].options.hls || {}, options.hls);
     this.setOptions_();
+
+    // overriding native HLS only works if audio tracks have been emulated
+    // error early if we're misconfigured:
+    if (this.options_.overrideNative && (tech.featuresNativeVideoTracks || tech.featuresNativeAudioTracks)) {
+      throw new Error('Overriding native HLS requires emulated tracks. ' + 'See https://git.io/vMpjB');
+    }
 
     // listen for fullscreenchange events for this player so that we
     // can adjust our quality selection quickly
@@ -17521,6 +19391,11 @@ var HlsHandler = (function (_Component) {
 
     this.audioTrackChange_ = function () {
       _this.masterPlaylistController_.setupAudio();
+      _this.tech_.trigger({ type: 'usage', name: 'hls-audio-change' });
+    };
+
+    this.textTrackChange_ = function () {
+      _this.masterPlaylistController_.setupSubtitles();
     };
 
     this.on(this.tech_, 'play', this.play);
@@ -17542,11 +19417,16 @@ var HlsHandler = (function (_Component) {
       // defaults
       this.options_.withCredentials = this.options_.withCredentials || false;
 
+      if (typeof this.options_.blacklistDuration !== 'number') {
+        this.options_.blacklistDuration = 5 * 60;
+      }
+
       // start playlist selection at a reasonable bandwidth for
-      // broadband internet
-      // 0.5 MB/s
+      // broadband internet (0.5 MB/s) or mobile (0.0625 MB/s)
       if (typeof this.options_.bandwidth !== 'number') {
-        this.options_.bandwidth = 4194304;
+        // only use Android for mobile because iOS does not support MSE (and uses
+        // native HLS)
+        this.options_.bandwidth = _videoJs2['default'].browser.IS_ANDROID ? INITIAL_BANDWIDTH_MOBILE : INITIAL_BANDWIDTH_DESKTOP;
       }
 
       // grab options passed to player.src
@@ -17585,6 +19465,12 @@ var HlsHandler = (function (_Component) {
           return _this3.seekable();
         }
       }));
+
+      this.masterPlaylistController_.on('error', function () {
+        var player = _videoJs2['default'].players[_this3.tech_.options_.playerId];
+
+        player.error(_this3.masterPlaylistController_.error);
+      });
 
       // `this` in selectPlaylist should be the HlsHandler for backwards
       // compatibility with < v2
@@ -17626,7 +19512,10 @@ var HlsHandler = (function (_Component) {
             // setting the bandwidth manually resets the throughput counter
             // `count` is set to zero that current value of `rate` isn't included
             // in the cumulative average
-            this.masterPlaylistController_.mainSegmentLoader_.throughput = { rate: 0, count: 0 };
+            this.masterPlaylistController_.mainSegmentLoader_.throughput = {
+              rate: 0,
+              count: 0
+            };
           }
         },
         /**
@@ -17714,6 +19603,7 @@ var HlsHandler = (function (_Component) {
 
       this.masterPlaylistController_.on('sourceopen', function () {
         _this3.tech_.audioTracks().addEventListener('change', _this3.audioTrackChange_);
+        _this3.tech_.remoteTextTracks().addEventListener('change', _this3.textTrackChange_);
       });
 
       this.masterPlaylistController_.on('selectedinitialmedia', function () {
@@ -17843,6 +19733,7 @@ var HlsHandler = (function (_Component) {
         this.qualityLevels_.dispose();
       }
       this.tech_.audioTracks().removeEventListener('change', this.audioTrackChange_);
+      this.tech_.remoteTextTracks().removeEventListener('change', this.textTrackChange_);
       _get(Object.getPrototypeOf(HlsHandler.prototype), 'dispose', this).call(this);
     }
   }]);
@@ -17853,14 +19744,22 @@ var HlsHandler = (function (_Component) {
 var HlsSourceHandler = function HlsSourceHandler(mode) {
   return {
     canHandleSource: function canHandleSource(srcObj) {
+      var options = arguments.length <= 1 || arguments[1] === undefined ? {} : arguments[1];
+
+      var localOptions = _videoJs2['default'].mergeOptions(_videoJs2['default'].options, options);
+
       // this forces video.js to skip this tech/mode if its not the one we have been
       // overriden to use, by returing that we cannot handle the source.
-      if (_videoJs2['default'].options.hls && _videoJs2['default'].options.hls.mode && _videoJs2['default'].options.hls.mode !== mode) {
+      if (localOptions.hls && localOptions.hls.mode && localOptions.hls.mode !== mode) {
         return false;
       }
-      return HlsSourceHandler.canPlayType(srcObj.type);
+      return HlsSourceHandler.canPlayType(srcObj.type, localOptions);
     },
-    handleSource: function handleSource(source, tech, options) {
+    handleSource: function handleSource(source, tech) {
+      var options = arguments.length <= 2 || arguments[2] === undefined ? {} : arguments[2];
+
+      var localOptions = _videoJs2['default'].mergeOptions(_videoJs2['default'].options, options, { hls: { mode: mode } });
+
       if (mode === 'flash') {
         // We need to trigger this asynchronously to give others the chance
         // to bind to the event when a source is set at player creation
@@ -17869,22 +19768,18 @@ var HlsSourceHandler = function HlsSourceHandler(mode) {
         }, 1);
       }
 
-      var settings = _videoJs2['default'].mergeOptions(options, { hls: { mode: mode } });
-
-      tech.hls = new HlsHandler(source, tech, settings);
-
+      tech.hls = new HlsHandler(source, tech, localOptions);
       tech.hls.xhr = (0, _xhr2['default'])();
-      // Use a global `before` function if specified on videojs.Hls.xhr
-      // but still allow for a per-player override
-      if (_videoJs2['default'].Hls.xhr.beforeRequest) {
-        tech.hls.xhr.beforeRequest = _videoJs2['default'].Hls.xhr.beforeRequest;
-      }
 
       tech.hls.src(source.src);
       return tech.hls;
     },
     canPlayType: function canPlayType(type) {
-      if (HlsSourceHandler.canPlayType(type)) {
+      var options = arguments.length <= 1 || arguments[1] === undefined ? {} : arguments[1];
+
+      var localOptions = _videoJs2['default'].mergeOptions(_videoJs2['default'].options, options);
+
+      if (HlsSourceHandler.canPlayType(type, localOptions)) {
         return 'maybe';
       }
       return '';
@@ -17892,66 +19787,7 @@ var HlsSourceHandler = function HlsSourceHandler(mode) {
   };
 };
 
-/**
- * A comparator function to sort two playlist object by bandwidth.
- *
- * @param {Object} left a media playlist object
- * @param {Object} right a media playlist object
- * @return {Number} Greater than zero if the bandwidth attribute of
- * left is greater than the corresponding attribute of right. Less
- * than zero if the bandwidth of right is greater than left and
- * exactly zero if the two are equal.
- */
-Hls.comparePlaylistBandwidth = function (left, right) {
-  var leftBandwidth = undefined;
-  var rightBandwidth = undefined;
-
-  if (left.attributes && left.attributes.BANDWIDTH) {
-    leftBandwidth = left.attributes.BANDWIDTH;
-  }
-  leftBandwidth = leftBandwidth || _globalWindow2['default'].Number.MAX_VALUE;
-  if (right.attributes && right.attributes.BANDWIDTH) {
-    rightBandwidth = right.attributes.BANDWIDTH;
-  }
-  rightBandwidth = rightBandwidth || _globalWindow2['default'].Number.MAX_VALUE;
-
-  return leftBandwidth - rightBandwidth;
-};
-
-/**
- * A comparator function to sort two playlist object by resolution (width).
- * @param {Object} left a media playlist object
- * @param {Object} right a media playlist object
- * @return {Number} Greater than zero if the resolution.width attribute of
- * left is greater than the corresponding attribute of right. Less
- * than zero if the resolution.width of right is greater than left and
- * exactly zero if the two are equal.
- */
-Hls.comparePlaylistResolution = function (left, right) {
-  var leftWidth = undefined;
-  var rightWidth = undefined;
-
-  if (left.attributes && left.attributes.RESOLUTION && left.attributes.RESOLUTION.width) {
-    leftWidth = left.attributes.RESOLUTION.width;
-  }
-
-  leftWidth = leftWidth || _globalWindow2['default'].Number.MAX_VALUE;
-
-  if (right.attributes && right.attributes.RESOLUTION && right.attributes.RESOLUTION.width) {
-    rightWidth = right.attributes.RESOLUTION.width;
-  }
-
-  rightWidth = rightWidth || _globalWindow2['default'].Number.MAX_VALUE;
-
-  // NOTE - Fallback to bandwidth sort as appropriate in cases where multiple renditions
-  // have the same media dimensions/ resolution
-  if (leftWidth === rightWidth && left.attributes.BANDWIDTH && right.attributes.BANDWIDTH) {
-    return left.attributes.BANDWIDTH - right.attributes.BANDWIDTH;
-  }
-  return leftWidth - rightWidth;
-};
-
-HlsSourceHandler.canPlayType = function (type) {
+HlsSourceHandler.canPlayType = function (type, options) {
   // No support for IE 10 or below
   if (_videoJs2['default'].browser.IE_VERSION && _videoJs2['default'].browser.IE_VERSION <= 10) {
     return false;
@@ -17960,7 +19796,7 @@ HlsSourceHandler.canPlayType = function (type) {
   var mpegurlRE = /^(audio|video|application)\/(x-|vnd\.apple\.)?mpegurl/i;
 
   // favor native HLS support if it's available
-  if (!_videoJs2['default'].options.hls.overrideNative && Hls.supportsNativeHls) {
+  if (!options.hls.overrideNative && Hls.supportsNativeHls) {
     return false;
   }
   return mpegurlRE.test(type);
@@ -18002,5 +19838,5 @@ module.exports = {
   HlsSourceHandler: HlsSourceHandler
 };
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./bin-utils":2,"./config":3,"./master-playlist-controller":5,"./playback-watcher":7,"./playlist":9,"./playlist-loader":8,"./reload-source-on-error":11,"./rendition-mixin":12,"./xhr":18,"aes-decrypter":22,"global/document":28,"global/window":29,"m3u8-parser":30,"videojs-contrib-media-sources":72}]},{},[75])(75)
+},{"./bin-utils":2,"./config":3,"./master-playlist-controller":5,"./playback-watcher":7,"./playlist":10,"./playlist-loader":8,"./playlist-selectors.js":9,"./reload-source-on-error":12,"./rendition-mixin":13,"./xhr":19,"aes-decrypter":23,"global/document":29,"global/window":30,"m3u8-parser":31,"videojs-contrib-media-sources":73}]},{},[76])(76)
 });
