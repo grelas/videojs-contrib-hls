@@ -1,6 +1,6 @@
 /**
  * videojs-contrib-hls
- * @version 5.8.0
+ * @version 5.8.3-bower
  * @copyright 2017 Brightcove, Inc
  * @license Apache-2.0
  */
@@ -117,7 +117,7 @@ exports['default'] = {
   findAdCue: findAdCue
 };
 module.exports = exports['default'];
-},{"global/window":30}],2:[function(require,module,exports){
+},{"global/window":27}],2:[function(require,module,exports){
 /**
  * @file bin-utils.js
  */
@@ -301,7 +301,7 @@ exports['default'] = function (self) {
 };
 
 module.exports = exports['default'];
-},{"./bin-utils":2,"aes-decrypter":23,"global/window":30}],5:[function(require,module,exports){
+},{"./bin-utils":2,"aes-decrypter":23,"global/window":27}],5:[function(require,module,exports){
 (function (global){
 /**
  * @file master-playlist-controller.js
@@ -663,7 +663,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
     this.segmentMetadataTrack_ = tech.addRemoteTextTrack({
       kind: 'metadata',
       label: 'segment-metadata'
-    }, true).track;
+    }, false).track;
 
     this.decrypter_ = (0, _webworkify2['default'])(_decrypterWorker2['default']);
 
@@ -1156,7 +1156,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
                 enabled: false,
                 language: properties.language,
                 label: label
-              }, true).track;
+              }, false).track;
 
               this.subtitleGroups_.tracks[label] = track;
             }
@@ -1192,7 +1192,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
       var videoPlaylist = this.masterPlaylistLoader_.media();
       var result = undefined;
 
-      if (videoPlaylist.attributes && videoPlaylist.attributes.AUDIO) {
+      if (videoPlaylist.attributes.AUDIO) {
         result = this.audioGroups_[videoPlaylist.attributes.AUDIO];
       }
 
@@ -1213,7 +1213,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
         return null;
       }
 
-      if (videoPlaylist.attributes && videoPlaylist.attributes.SUBTITLES) {
+      if (videoPlaylist.attributes.SUBTITLES) {
         result = this.subtitleGroups_.groups[videoPlaylist.attributes.SUBTITLES];
       }
 
@@ -2014,7 +2014,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
       var videoCodec = null;
       var codecs = undefined;
 
-      if (media.attributes && media.attributes.CODECS) {
+      if (media.attributes.CODECS) {
         codecs = parseCodecs(media.attributes.CODECS);
         videoCodec = codecs.videoCodec;
         codecCount = codecs.codecCount;
@@ -2025,7 +2025,7 @@ var MasterPlaylistController = (function (_videojs$EventTarget) {
           videoCodec: null
         };
 
-        if (variant.attributes && variant.attributes.CODECS) {
+        if (variant.attributes.CODECS) {
           var codecString = variant.attributes.CODECS;
 
           variantCodecs = parseCodecs(codecString);
@@ -2984,7 +2984,7 @@ var PlaybackWatcher = (function () {
 exports['default'] = PlaybackWatcher;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./ranges":11,"global/window":30}],8:[function(require,module,exports){
+},{"./ranges":11,"global/window":27}],8:[function(require,module,exports){
 (function (global){
 /**
  * @file playlist-loader.js
@@ -3173,6 +3173,9 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
     parser.push(xhr.responseText);
     parser.end();
     parser.manifest.uri = url;
+    // m3u8-parser does not attach an attributes property to media playlists so make
+    // sure that the property is attached to avoid undefined reference errors
+    parser.manifest.attributes = parser.manifest.attributes || {};
 
     // merge this playlist into the master
     update = updateMaster(loader.master, parser.manifest);
@@ -3251,12 +3254,7 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
         return false;
       }
 
-      var bandwidth = 0;
-
-      if (playlist && playlist.attributes) {
-        bandwidth = playlist.attributes.BANDWIDTH;
-      }
-      return bandwidth < currentBandwidth;
+      return (playlist.attributes.BANDWIDTH || 0) < currentBandwidth;
     }).length === 0;
   };
 
@@ -3510,6 +3508,17 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
           playlist = loader.master.playlists[i];
           loader.master.playlists[playlist.uri] = playlist;
           playlist.resolvedUri = (0, _resolveUrl2['default'])(loader.master.uri, playlist.uri);
+
+          if (!playlist.attributes) {
+            // Although the spec states an #EXT-X-STREAM-INF tag MUST have a
+            // BANDWIDTH attribute, we can play the stream without it. This means a poorly
+            // formatted master playlist may not have an attribute list. An attributes
+            // property is added here to prevent undefined references when we encounter
+            // this scenario.
+            playlist.attributes = {};
+
+            _videoJs.log.warn('Invalid playlist STREAM-INF detected. Missing BANDWIDTH attribute.');
+          }
         }
 
         // resolve any media group URIs
@@ -3550,6 +3559,9 @@ var PlaylistLoader = function PlaylistLoader(srcUrl, hls, withCredentials) {
       };
       loader.master.playlists[srcUrl] = loader.master.playlists[0];
       loader.master.playlists[0].resolvedUri = srcUrl;
+      // m3u8-parser does not attach an attributes property to media playlists so make
+      // sure that the property is attached to avoid undefined reference errors
+      loader.master.playlists[0].attributes = loader.master.playlists[0].attributes || {};
       haveMetadata(req, srcUrl);
       return loader.trigger('loadedmetadata');
     });
@@ -3561,7 +3573,7 @@ PlaylistLoader.prototype = new _videoJs.EventTarget();
 exports['default'] = PlaylistLoader;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./playlist.js":10,"./resolve-url":14,"global/window":30,"m3u8-parser":31}],9:[function(require,module,exports){
+},{"./playlist.js":10,"./resolve-url":14,"global/window":27,"m3u8-parser":28}],9:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, '__esModule', {
@@ -3639,11 +3651,11 @@ var comparePlaylistBandwidth = function comparePlaylistBandwidth(left, right) {
   var leftBandwidth = undefined;
   var rightBandwidth = undefined;
 
-  if (left.attributes && left.attributes.BANDWIDTH) {
+  if (left.attributes.BANDWIDTH) {
     leftBandwidth = left.attributes.BANDWIDTH;
   }
   leftBandwidth = leftBandwidth || window.Number.MAX_VALUE;
-  if (right.attributes && right.attributes.BANDWIDTH) {
+  if (right.attributes.BANDWIDTH) {
     rightBandwidth = right.attributes.BANDWIDTH;
   }
   rightBandwidth = rightBandwidth || window.Number.MAX_VALUE;
@@ -3665,13 +3677,13 @@ var comparePlaylistResolution = function comparePlaylistResolution(left, right) 
   var leftWidth = undefined;
   var rightWidth = undefined;
 
-  if (left.attributes && left.attributes.RESOLUTION && left.attributes.RESOLUTION.width) {
+  if (left.attributes.RESOLUTION && left.attributes.RESOLUTION.width) {
     leftWidth = left.attributes.RESOLUTION.width;
   }
 
   leftWidth = leftWidth || window.Number.MAX_VALUE;
 
-  if (right.attributes && right.attributes.RESOLUTION && right.attributes.RESOLUTION.width) {
+  if (right.attributes.RESOLUTION && right.attributes.RESOLUTION.width) {
     rightWidth = right.attributes.RESOLUTION.width;
   }
 
@@ -3708,11 +3720,9 @@ var simpleSelector = function simpleSelector(master, playerBandwidth, playerWidt
     var height = undefined;
     var bandwidth = undefined;
 
-    if (playlist.attributes) {
-      width = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.width;
-      height = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.height;
-      bandwidth = playlist.attributes.BANDWIDTH;
-    }
+    width = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.width;
+    height = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.height;
+    bandwidth = playlist.attributes.BANDWIDTH;
 
     bandwidth = bandwidth || window.Number.MAX_VALUE;
 
@@ -4433,7 +4443,7 @@ Playlist.estimateSegmentRequestTime = estimateSegmentRequestTime;
 // exports
 exports['default'] = Playlist;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"global/window":30}],11:[function(require,module,exports){
+},{"global/window":27}],11:[function(require,module,exports){
 (function (global){
 /**
  * ranges
@@ -5010,20 +5020,15 @@ var Representation = function Representation(hlsHandler, playlist, id) {
   // Get a reference to a bound version of fastQualityChange_
   var fastChangeFunction = hlsHandler.masterPlaylistController_.fastQualityChange_.bind(hlsHandler.masterPlaylistController_);
 
-  // Carefully descend into the playlist's attributes since most
-  // properties are optional
-  if (playlist.attributes) {
-    var attributes = playlist.attributes;
+  // some playlist attributes are optional
+  if (playlist.attributes.RESOLUTION) {
+    var resolution = playlist.attributes.RESOLUTION;
 
-    if (attributes.RESOLUTION) {
-      var resolution = attributes.RESOLUTION;
-
-      this.width = resolution.width;
-      this.height = resolution.height;
-    }
-
-    this.bandwidth = attributes.BANDWIDTH;
+    this.width = resolution.width;
+    this.height = resolution.height;
   }
+
+  this.bandwidth = playlist.attributes.BANDWIDTH;
 
   // The id is simply the ordinality of the media playlist
   // within the master playlist
@@ -5094,7 +5099,7 @@ var resolveUrl = function resolveUrl(baseURL, relativeURL) {
 
 exports['default'] = resolveUrl;
 module.exports = exports['default'];
-},{"global/window":30,"url-toolkit":61}],15:[function(require,module,exports){
+},{"global/window":27,"url-toolkit":61}],15:[function(require,module,exports){
 (function (global){
 /**
  * @file segment-loader.js
@@ -5622,7 +5627,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
     value: function resetEverything() {
       this.ended_ = false;
       this.resetLoader();
-      this.remove(0, Infinity);
+      this.remove(0, this.duration_());
     }
 
     /**
@@ -5926,7 +5931,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
       //       the lowestEnabledRendition.
       !this.xhrOptions_.timeout ||
       // Don't abort if we have no bandwidth information to estimate segment sizes
-      !(this.playlist_.attributes && this.playlist_.attributes.BANDWIDTH)) {
+      !this.playlist_.attributes.BANDWIDTH) {
         return false;
       }
 
@@ -6418,7 +6423,7 @@ var SegmentLoader = (function (_videojs$EventTarget) {
 exports['default'] = SegmentLoader;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./bin-utils":2,"./config":3,"./media-segment-request":6,"./playlist":10,"./playlist-selectors":9,"./ranges":11,"./source-updater":16,"global/window":30,"videojs-contrib-media-sources/es5/remove-cues-from-track.js":71}],16:[function(require,module,exports){
+},{"./bin-utils":2,"./config":3,"./media-segment-request":6,"./playlist":10,"./playlist-selectors":9,"./ranges":11,"./source-updater":16,"global/window":27,"videojs-contrib-media-sources/es5/remove-cues-from-track.js":71}],16:[function(require,module,exports){
 (function (global){
 /**
  * @file source-updater.js
@@ -7226,7 +7231,7 @@ var SyncController = (function (_videojs$EventTarget) {
 
 exports['default'] = SyncController;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./playlist":10,"mux.js/lib/mp4/probe":55,"mux.js/lib/tools/ts-inspector.js":57}],18:[function(require,module,exports){
+},{"./playlist":10,"mux.js/lib/mp4/probe":52,"mux.js/lib/tools/ts-inspector.js":54}],18:[function(require,module,exports){
 (function (global){
 /**
  * @file vtt-segment-loader.js
@@ -7557,6 +7562,11 @@ var VTTSegmentLoader = (function (_SegmentLoader) {
 
       this.mediaSecondsLoaded += segment.duration;
 
+      if (segmentInfo.cues.length) {
+        // remove any overlapping cues to prevent doubling
+        this.remove(segmentInfo.cues[0].endTime, segmentInfo.cues[segmentInfo.cues.length - 1].endTime);
+      }
+
       segmentInfo.cues.forEach(function (cue) {
         _this2.subtitlesTrack_.addCue(cue);
       });
@@ -7677,7 +7687,7 @@ var VTTSegmentLoader = (function (_SegmentLoader) {
 exports['default'] = VTTSegmentLoader;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./bin-utils":2,"./segment-loader":15,"global/window":30,"videojs-contrib-media-sources/es5/remove-cues-from-track.js":71}],19:[function(require,module,exports){
+},{"./bin-utils":2,"./segment-loader":15,"global/window":27,"videojs-contrib-media-sources/es5/remove-cues-from-track.js":71}],19:[function(require,module,exports){
 (function (global){
 /**
  * @file xhr.js
@@ -8277,7 +8287,7 @@ exports['default'] = {
   Decrypter: Decrypter,
   decrypt: decrypt
 };
-},{"./aes":20,"./async-stream":21,"pkcs7":26}],23:[function(require,module,exports){
+},{"./aes":20,"./async-stream":21,"pkcs7":59}],23:[function(require,module,exports){
 /**
  * @file index.js
  *
@@ -8440,161 +8450,46 @@ var Stream = (function () {
 exports['default'] = Stream;
 module.exports = exports['default'];
 },{}],25:[function(require,module,exports){
-/*
- * pkcs7.pad
- * https://github.com/brightcove/pkcs7
- *
- * Copyright (c) 2014 Brightcove
- * Licensed under the apache2 license.
- */
-
-'use strict';
-
-var PADDING;
-
-/**
- * Returns a new Uint8Array that is padded with PKCS#7 padding.
- * @param plaintext {Uint8Array} the input bytes before encryption
- * @return {Uint8Array} the padded bytes
- * @see http://tools.ietf.org/html/rfc5652
- */
-module.exports = function pad(plaintext) {
-  var padding = PADDING[(plaintext.byteLength % 16) || 0],
-      result = new Uint8Array(plaintext.byteLength + padding.length);
-  result.set(plaintext);
-  result.set(padding, plaintext.byteLength);
-  return result;
-};
-
-// pre-define the padding values
-PADDING = [
-  [16, 16, 16, 16,
-   16, 16, 16, 16,
-   16, 16, 16, 16,
-   16, 16, 16, 16],
-
-  [15, 15, 15, 15,
-   15, 15, 15, 15,
-   15, 15, 15, 15,
-   15, 15, 15],
-
-  [14, 14, 14, 14,
-   14, 14, 14, 14,
-   14, 14, 14, 14,
-   14, 14],
-
-  [13, 13, 13, 13,
-   13, 13, 13, 13,
-   13, 13, 13, 13,
-   13],
-
-  [12, 12, 12, 12,
-   12, 12, 12, 12,
-   12, 12, 12, 12],
-
-  [11, 11, 11, 11,
-   11, 11, 11, 11,
-   11, 11, 11],
-
-  [10, 10, 10, 10,
-   10, 10, 10, 10,
-   10, 10],
-
-  [9, 9, 9, 9,
-   9, 9, 9, 9,
-   9],
-
-  [8, 8, 8, 8,
-   8, 8, 8, 8],
-
-  [7, 7, 7, 7,
-   7, 7, 7],
-
-  [6, 6, 6, 6,
-   6, 6],
-
-  [5, 5, 5, 5,
-   5],
-
-  [4, 4, 4, 4],
-
-  [3, 3, 3],
-
-  [2, 2],
-
-  [1]
-];
 
 },{}],26:[function(require,module,exports){
-/*
- * pkcs7
- * https://github.com/brightcove/pkcs7
- *
- * Copyright (c) 2014 Brightcove
- * Licensed under the apache2 license.
- */
-
-'use strict';
-
-exports.pad = require('./pad.js');
-exports.unpad = require('./unpad.js');
-
-},{"./pad.js":25,"./unpad.js":27}],27:[function(require,module,exports){
-/*
- * pkcs7.unpad
- * https://github.com/brightcove/pkcs7
- *
- * Copyright (c) 2014 Brightcove
- * Licensed under the apache2 license.
- */
-
-'use strict';
-
-/**
- * Returns the subarray of a Uint8Array without PKCS#7 padding.
- * @param padded {Uint8Array} unencrypted bytes that have been padded
- * @return {Uint8Array} the unpadded bytes
- * @see http://tools.ietf.org/html/rfc5652
- */
-module.exports = function unpad(padded) {
-  return padded.subarray(0, padded.byteLength - padded[padded.byteLength - 1]);
-};
-
-},{}],28:[function(require,module,exports){
-
-},{}],29:[function(require,module,exports){
 (function (global){
 var topLevel = typeof global !== 'undefined' ? global :
     typeof window !== 'undefined' ? window : {}
 var minDoc = require('min-document');
 
+var doccy;
+
 if (typeof document !== 'undefined') {
-    module.exports = document;
+    doccy = document;
 } else {
-    var doccy = topLevel['__GLOBAL_DOCUMENT_CACHE@4'];
+    doccy = topLevel['__GLOBAL_DOCUMENT_CACHE@4'];
 
     if (!doccy) {
         doccy = topLevel['__GLOBAL_DOCUMENT_CACHE@4'] = minDoc;
     }
-
-    module.exports = doccy;
 }
 
+module.exports = doccy;
+
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"min-document":28}],30:[function(require,module,exports){
+},{"min-document":25}],27:[function(require,module,exports){
 (function (global){
+var win;
+
 if (typeof window !== "undefined") {
-    module.exports = window;
+    win = window;
 } else if (typeof global !== "undefined") {
-    module.exports = global;
+    win = global;
 } else if (typeof self !== "undefined"){
-    module.exports = self;
+    win = self;
 } else {
-    module.exports = {};
+    win = {};
 }
 
+module.exports = win;
+
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],31:[function(require,module,exports){
+},{}],28:[function(require,module,exports){
 'use strict';
 
 var _lineStream = require('./line-stream');
@@ -8624,7 +8519,7 @@ module.exports = {
     * that do not assume the entirety of the manifest is ready and expose a
     * ReadableStream-like interface.
     */
-},{"./line-stream":32,"./parse-stream":33,"./parser":34}],32:[function(require,module,exports){
+},{"./line-stream":29,"./parse-stream":30,"./parser":31}],29:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -8693,7 +8588,7 @@ var LineStream = function (_Stream) {
 }(_stream2['default']);
 
 exports['default'] = LineStream;
-},{"./stream":35}],33:[function(require,module,exports){
+},{"./stream":32}],30:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -9146,7 +9041,7 @@ var ParseStream = function (_Stream) {
 }(_stream2['default']);
 
 exports['default'] = ParseStream;
-},{"./stream":35}],34:[function(require,module,exports){
+},{"./stream":32}],31:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -9537,7 +9432,7 @@ var Parser = function (_Stream) {
 }(_stream2['default']);
 
 exports['default'] = Parser;
-},{"./line-stream":32,"./parse-stream":33,"./stream":35}],35:[function(require,module,exports){
+},{"./line-stream":29,"./parse-stream":30,"./stream":32}],32:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -9670,7 +9565,7 @@ var Stream = function () {
 }();
 
 exports['default'] = Stream;
-},{}],36:[function(require,module,exports){
+},{}],33:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -9815,7 +9710,7 @@ AacStream.prototype = new Stream();
 
 module.exports = AacStream;
 
-},{"../utils/stream.js":60}],37:[function(require,module,exports){
+},{"../utils/stream.js":57}],34:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -9978,7 +9873,7 @@ module.exports = {
   parseAacTimestamp: parseAacTimestamp
 };
 
-},{}],38:[function(require,module,exports){
+},{}],35:[function(require,module,exports){
 'use strict';
 
 var Stream = require('../utils/stream.js');
@@ -10112,7 +10007,7 @@ AdtsStream.prototype = new Stream();
 
 module.exports = AdtsStream;
 
-},{"../utils/stream.js":60}],39:[function(require,module,exports){
+},{"../utils/stream.js":57}],36:[function(require,module,exports){
 'use strict';
 
 var Stream = require('../utils/stream.js');
@@ -10532,7 +10427,7 @@ module.exports = {
   NalByteStream: NalByteStream
 };
 
-},{"../utils/exp-golomb.js":59,"../utils/stream.js":60}],40:[function(require,module,exports){
+},{"../utils/exp-golomb.js":56,"../utils/stream.js":57}],37:[function(require,module,exports){
 var highPrefix = [33, 16, 5, 32, 164, 27];
 var lowPrefix = [33, 65, 108, 84, 1, 2, 4, 8, 168, 2, 4, 8, 17, 191, 252];
 var zeroFill = function(count) {
@@ -10569,7 +10464,7 @@ var coneOfSilence = {
 
 module.exports = makeTable(coneOfSilence);
 
-},{}],41:[function(require,module,exports){
+},{}],38:[function(require,module,exports){
 'use strict';
 
 var Stream = require('../utils/stream.js');
@@ -10714,7 +10609,7 @@ CoalesceStream.prototype.flush = function(flushSource) {
 
 module.exports = CoalesceStream;
 
-},{"../utils/stream.js":60}],42:[function(require,module,exports){
+},{"../utils/stream.js":57}],39:[function(require,module,exports){
 'use strict';
 
 var FlvTag = require('./flv-tag.js');
@@ -10776,7 +10671,7 @@ var getFlvHeader = function(duration, audio, video) { // :ByteArray {
 
 module.exports = getFlvHeader;
 
-},{"./flv-tag.js":43}],43:[function(require,module,exports){
+},{"./flv-tag.js":40}],40:[function(require,module,exports){
 /**
  * An object that stores the bytes of an FLV tag and methods for
  * querying and manipulating that data.
@@ -11150,14 +11045,14 @@ FlvTag.frameTime = function(tag) {
 
 module.exports = FlvTag;
 
-},{}],44:[function(require,module,exports){
+},{}],41:[function(require,module,exports){
 module.exports = {
   tag: require('./flv-tag'),
   Transmuxer: require('./transmuxer'),
   getFlvHeader: require('./flv-header')
 };
 
-},{"./flv-header":42,"./flv-tag":43,"./transmuxer":46}],45:[function(require,module,exports){
+},{"./flv-header":39,"./flv-tag":40,"./transmuxer":43}],42:[function(require,module,exports){
 'use strict';
 
 var TagList = function() {
@@ -11184,7 +11079,7 @@ var TagList = function() {
 
 module.exports = TagList;
 
-},{}],46:[function(require,module,exports){
+},{}],43:[function(require,module,exports){
 'use strict';
 
 var Stream = require('../utils/stream.js');
@@ -11602,7 +11497,7 @@ Transmuxer.prototype = new Stream();
 // forward compatibility
 module.exports = Transmuxer;
 
-},{"../codecs/adts.js":38,"../codecs/h264":39,"../m2ts/m2ts.js":48,"../utils/stream.js":60,"./coalesce-stream.js":41,"./flv-tag.js":43,"./tag-list.js":45}],47:[function(require,module,exports){
+},{"../codecs/adts.js":35,"../codecs/h264":36,"../m2ts/m2ts.js":45,"../utils/stream.js":57,"./coalesce-stream.js":38,"./flv-tag.js":40,"./tag-list.js":42}],44:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -12068,7 +11963,7 @@ module.exports = {
   Cea608Stream: Cea608Stream
 };
 
-},{"../utils/stream":60}],48:[function(require,module,exports){
+},{"../utils/stream":57}],45:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -12547,7 +12442,7 @@ for (var type in StreamTypes) {
 
 module.exports = m2ts;
 
-},{"../utils/stream.js":60,"./caption-stream":47,"./metadata-stream":49,"./stream-types":51,"./stream-types.js":51,"./timestamp-rollover-stream":52}],49:[function(require,module,exports){
+},{"../utils/stream.js":57,"./caption-stream":44,"./metadata-stream":46,"./stream-types":48,"./stream-types.js":48,"./timestamp-rollover-stream":49}],46:[function(require,module,exports){
 /**
  * Accepts program elementary stream (PES) data events and parses out
  * ID3 metadata from them, if present.
@@ -12797,7 +12692,7 @@ MetadataStream.prototype = new Stream();
 
 module.exports = MetadataStream;
 
-},{"../utils/stream":60,"./stream-types":51}],50:[function(require,module,exports){
+},{"../utils/stream":57,"./stream-types":48}],47:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -13086,7 +12981,7 @@ module.exports = {
   videoPacketContainsKeyFrame: videoPacketContainsKeyFrame
 };
 
-},{"./stream-types.js":51}],51:[function(require,module,exports){
+},{"./stream-types.js":48}],48:[function(require,module,exports){
 'use strict';
 
 module.exports = {
@@ -13095,7 +12990,7 @@ module.exports = {
   METADATA_STREAM_TYPE: 0x15
 };
 
-},{}],52:[function(require,module,exports){
+},{}],49:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -13181,7 +13076,7 @@ module.exports = {
   handleRollover: handleRollover
 };
 
-},{"../utils/stream":60}],53:[function(require,module,exports){
+},{"../utils/stream":57}],50:[function(require,module,exports){
 module.exports = {
   generator: require('./mp4-generator'),
   Transmuxer: require('./transmuxer').Transmuxer,
@@ -13189,7 +13084,7 @@ module.exports = {
   VideoSegmentStream: require('./transmuxer').VideoSegmentStream
 };
 
-},{"./mp4-generator":54,"./transmuxer":56}],54:[function(require,module,exports){
+},{"./mp4-generator":51,"./transmuxer":53}],51:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -13961,7 +13856,7 @@ module.exports = {
   }
 };
 
-},{}],55:[function(require,module,exports){
+},{}],52:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -14151,7 +14046,7 @@ module.exports = {
   startTime: startTime
 };
 
-},{}],56:[function(require,module,exports){
+},{}],53:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -15411,7 +15306,7 @@ module.exports = {
   VIDEO_PROPERTIES: VIDEO_PROPERTIES
 };
 
-},{"../aac":36,"../codecs/adts.js":38,"../codecs/h264":39,"../data/silence":40,"../m2ts/m2ts.js":48,"../utils/clock":58,"../utils/stream.js":60,"./mp4-generator.js":54}],57:[function(require,module,exports){
+},{"../aac":33,"../codecs/adts.js":35,"../codecs/h264":36,"../data/silence":37,"../m2ts/m2ts.js":45,"../utils/clock":55,"../utils/stream.js":57,"./mp4-generator.js":51}],54:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -15925,7 +15820,7 @@ module.exports = {
   inspect: inspect
 };
 
-},{"../aac/probe.js":37,"../m2ts/probe.js":50,"../m2ts/stream-types.js":51,"../m2ts/timestamp-rollover-stream.js":52}],58:[function(require,module,exports){
+},{"../aac/probe.js":34,"../m2ts/probe.js":47,"../m2ts/stream-types.js":48,"../m2ts/timestamp-rollover-stream.js":49}],55:[function(require,module,exports){
 var
   ONE_SECOND_IN_TS = 90000, // 90kHz clock
   secondsToVideoTs,
@@ -15968,7 +15863,7 @@ module.exports = {
   videoTsToAudioTs: videoTsToAudioTs
 };
 
-},{}],59:[function(require,module,exports){
+},{}],56:[function(require,module,exports){
 'use strict';
 
 var ExpGolomb;
@@ -16117,7 +16012,7 @@ ExpGolomb = function(workingData) {
 
 module.exports = ExpGolomb;
 
-},{}],60:[function(require,module,exports){
+},{}],57:[function(require,module,exports){
 /**
  * mux.js
  *
@@ -16235,6 +16130,127 @@ Stream.prototype.flush = function(flushSource) {
 };
 
 module.exports = Stream;
+
+},{}],58:[function(require,module,exports){
+/*
+ * pkcs7.pad
+ * https://github.com/brightcove/pkcs7
+ *
+ * Copyright (c) 2014 Brightcove
+ * Licensed under the apache2 license.
+ */
+
+'use strict';
+
+var PADDING;
+
+/**
+ * Returns a new Uint8Array that is padded with PKCS#7 padding.
+ * @param plaintext {Uint8Array} the input bytes before encryption
+ * @return {Uint8Array} the padded bytes
+ * @see http://tools.ietf.org/html/rfc5652
+ */
+module.exports = function pad(plaintext) {
+  var padding = PADDING[(plaintext.byteLength % 16) || 0],
+      result = new Uint8Array(plaintext.byteLength + padding.length);
+  result.set(plaintext);
+  result.set(padding, plaintext.byteLength);
+  return result;
+};
+
+// pre-define the padding values
+PADDING = [
+  [16, 16, 16, 16,
+   16, 16, 16, 16,
+   16, 16, 16, 16,
+   16, 16, 16, 16],
+
+  [15, 15, 15, 15,
+   15, 15, 15, 15,
+   15, 15, 15, 15,
+   15, 15, 15],
+
+  [14, 14, 14, 14,
+   14, 14, 14, 14,
+   14, 14, 14, 14,
+   14, 14],
+
+  [13, 13, 13, 13,
+   13, 13, 13, 13,
+   13, 13, 13, 13,
+   13],
+
+  [12, 12, 12, 12,
+   12, 12, 12, 12,
+   12, 12, 12, 12],
+
+  [11, 11, 11, 11,
+   11, 11, 11, 11,
+   11, 11, 11],
+
+  [10, 10, 10, 10,
+   10, 10, 10, 10,
+   10, 10],
+
+  [9, 9, 9, 9,
+   9, 9, 9, 9,
+   9],
+
+  [8, 8, 8, 8,
+   8, 8, 8, 8],
+
+  [7, 7, 7, 7,
+   7, 7, 7],
+
+  [6, 6, 6, 6,
+   6, 6],
+
+  [5, 5, 5, 5,
+   5],
+
+  [4, 4, 4, 4],
+
+  [3, 3, 3],
+
+  [2, 2],
+
+  [1]
+];
+
+},{}],59:[function(require,module,exports){
+/*
+ * pkcs7
+ * https://github.com/brightcove/pkcs7
+ *
+ * Copyright (c) 2014 Brightcove
+ * Licensed under the apache2 license.
+ */
+
+'use strict';
+
+exports.pad = require('./pad.js');
+exports.unpad = require('./unpad.js');
+
+},{"./pad.js":58,"./unpad.js":60}],60:[function(require,module,exports){
+/*
+ * pkcs7.unpad
+ * https://github.com/brightcove/pkcs7
+ *
+ * Copyright (c) 2014 Brightcove
+ * Licensed under the apache2 license.
+ */
+
+'use strict';
+
+/**
+ * Returns the subarray of a Uint8Array without PKCS#7 padding.
+ * @param padded {Uint8Array} unencrypted bytes that have been padded
+ * @return {Uint8Array} the unpadded bytes
+ * @see http://tools.ietf.org/html/rfc5652
+ */
+module.exports = function unpad(padded) {
+  return padded.subarray(0, padded.byteLength - padded[padded.byteLength - 1]);
+};
 
 },{}],61:[function(require,module,exports){
 /* jshint ignore:start */
@@ -16490,7 +16506,7 @@ exports['default'] = {
 };
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"global/window":30}],63:[function(require,module,exports){
+},{"global/window":27}],63:[function(require,module,exports){
 /**
  * Remove the text track from the player if one with matching kind and
  * label properties already exists on the player
@@ -16814,7 +16830,7 @@ var FlashMediaSource = (function (_videojs$EventTarget) {
       var sourceBuffer = undefined;
 
       // if this is an FLV type, we'll push data to flash
-      if (parsedType.type === 'video/mp2t') {
+      if (parsedType.type === 'video/mp2t' || parsedType.type === 'audio/mp2t') {
         // Flash source buffers
         sourceBuffer = new _flashSourceBuffer2['default'](this);
       } else {
@@ -16905,7 +16921,7 @@ for (var property in _flashConstants2['default']) {
 }
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./cleanup-text-tracks":63,"./codec-utils":64,"./flash-constants":66,"./flash-source-buffer":68,"global/document":29}],68:[function(require,module,exports){
+},{"./cleanup-text-tracks":63,"./codec-utils":64,"./flash-constants":66,"./flash-source-buffer":68,"global/document":26}],68:[function(require,module,exports){
 (function (global){
 /**
  * @file flash-source-buffer.js
@@ -17507,7 +17523,7 @@ var FlashSourceBuffer = (function (_videojs$EventTarget) {
 exports['default'] = FlashSourceBuffer;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./add-text-track-data":62,"./create-text-tracks-if-necessary":65,"./flash-constants":66,"./flash-transmuxer-worker":69,"./remove-cues-from-track":71,"global/window":30,"mux.js/lib/flv":44,"webworkify":75}],69:[function(require,module,exports){
+},{"./add-text-track-data":62,"./create-text-tracks-if-necessary":65,"./flash-constants":66,"./flash-transmuxer-worker":69,"./remove-cues-from-track":71,"global/window":27,"mux.js/lib/flv":41,"webworkify":75}],69:[function(require,module,exports){
 /**
  * @file flash-transmuxer-worker.js
  */
@@ -17652,7 +17668,7 @@ exports['default'] = function (self) {
 };
 
 module.exports = exports['default'];
-},{"global/window":30,"mux.js/lib/flv":44}],70:[function(require,module,exports){
+},{"global/window":27,"mux.js/lib/flv":41}],70:[function(require,module,exports){
 (function (global){
 /**
  * @file html-media-source.js
@@ -17779,10 +17795,23 @@ var HtmlMediaSource = (function (_videojs$EventTarget) {
       // Retain the reference but empty the array
       _this.activeSourceBuffers_.length = 0;
 
+      // If there is only one source buffer, then it will always be active and audio will
+      // be disabled based on the codec of the source buffer
+      if (_this.sourceBuffers.length === 1) {
+        var sourceBuffer = _this.sourceBuffers[0];
+
+        sourceBuffer.appendAudioInitSegment_ = true;
+        sourceBuffer.audioDisabled_ = !sourceBuffer.audioCodec_;
+        _this.activeSourceBuffers_.push(sourceBuffer);
+        return;
+      }
+
+      // There are 2 source buffers, a combined (possibly video only) source buffer and
+      // and an audio only source buffer.
       // By default, the audio in the combined virtual source buffer is enabled
       // and the audio-only source buffer (if it exists) is disabled.
-      var combined = false;
-      var audioOnly = true;
+      var disableCombined = false;
+      var disableAudioOnly = true;
 
       // TODO: maybe we can store the sourcebuffers on the track objects?
       // safari may do something like this
@@ -17792,14 +17821,12 @@ var HtmlMediaSource = (function (_videojs$EventTarget) {
         if (track.enabled && track.kind !== 'main') {
           // The enabled track is an alternate audio track so disable the audio in
           // the combined source buffer and enable the audio-only source buffer.
-          combined = true;
-          audioOnly = false;
+          disableCombined = true;
+          disableAudioOnly = false;
           break;
         }
       }
 
-      // Since we currently support a max of two source buffers, add all of the source
-      // buffers (in order).
       _this.sourceBuffers.forEach(function (sourceBuffer) {
         /* eslinst-disable */
         // TODO once codecs are required, we can switch to using the codecs to determine
@@ -17810,17 +17837,17 @@ var HtmlMediaSource = (function (_videojs$EventTarget) {
 
         if (sourceBuffer.videoCodec_ && sourceBuffer.audioCodec_) {
           // combined
-          sourceBuffer.audioDisabled_ = combined;
+          sourceBuffer.audioDisabled_ = disableCombined;
         } else if (sourceBuffer.videoCodec_ && !sourceBuffer.audioCodec_) {
           // If the "combined" source buffer is video only, then we do not want
           // disable the audio-only source buffer (this is mostly for demuxed
           // audio and video hls)
           sourceBuffer.audioDisabled_ = true;
-          audioOnly = false;
+          disableAudioOnly = false;
         } else if (!sourceBuffer.videoCodec_ && sourceBuffer.audioCodec_) {
           // audio only
-          sourceBuffer.audioDisabled_ = audioOnly;
-          if (audioOnly) {
+          sourceBuffer.audioDisabled_ = disableAudioOnly;
+          if (disableAudioOnly) {
             return;
           }
         }
@@ -17992,7 +18019,7 @@ var HtmlMediaSource = (function (_videojs$EventTarget) {
 exports['default'] = HtmlMediaSource;
 module.exports = exports['default'];
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./add-text-track-data":62,"./cleanup-text-tracks":63,"./codec-utils":64,"./virtual-source-buffer":74,"global/document":29,"global/window":30}],71:[function(require,module,exports){
+},{"./add-text-track-data":62,"./cleanup-text-tracks":63,"./codec-utils":64,"./virtual-source-buffer":74,"global/document":26,"global/window":27}],71:[function(require,module,exports){
 /**
  * @file remove-cues-from-track.js
  */
@@ -18240,7 +18267,7 @@ exports['default'] = function (self) {
 };
 
 module.exports = exports['default'];
-},{"global/window":30,"mux.js/lib/mp4":53}],73:[function(require,module,exports){
+},{"global/window":27,"mux.js/lib/mp4":50}],73:[function(require,module,exports){
 (function (global){
 /**
  * @file videojs-contrib-media-sources.js
@@ -18399,7 +18426,7 @@ exports.URL = URL;
 _videoJs2['default'].MediaSource = MediaSource;
 _videoJs2['default'].URL = URL;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./flash-media-source":67,"./html-media-source":70,"global/window":30}],74:[function(require,module,exports){
+},{"./flash-media-source":67,"./html-media-source":70,"global/window":27}],74:[function(require,module,exports){
 (function (global){
 /**
  * @file virtual-source-buffer.js
@@ -18709,6 +18736,12 @@ var VirtualSourceBuffer = (function (_videojs$EventTarget) {
   }, {
     key: 'done_',
     value: function done_(event) {
+      // Don't process and append data if the mediaSource is closed
+      if (this.mediaSource_.readyState === 'closed') {
+        this.pendingBuffers_.length = 0;
+        return;
+      }
+
       // All buffers should have been flushed from the muxer
       // start processing anything we have received
       this.processPendingSegments_();
@@ -19838,5 +19871,5 @@ module.exports = {
   HlsSourceHandler: HlsSourceHandler
 };
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./bin-utils":2,"./config":3,"./master-playlist-controller":5,"./playback-watcher":7,"./playlist":10,"./playlist-loader":8,"./playlist-selectors.js":9,"./reload-source-on-error":12,"./rendition-mixin":13,"./xhr":19,"aes-decrypter":23,"global/document":29,"global/window":30,"m3u8-parser":31,"videojs-contrib-media-sources":73}]},{},[76])(76)
+},{"./bin-utils":2,"./config":3,"./master-playlist-controller":5,"./playback-watcher":7,"./playlist":10,"./playlist-loader":8,"./playlist-selectors.js":9,"./reload-source-on-error":12,"./rendition-mixin":13,"./xhr":19,"aes-decrypter":23,"global/document":26,"global/window":27,"m3u8-parser":28,"videojs-contrib-media-sources":73}]},{},[76])(76)
 });
